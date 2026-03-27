@@ -113,6 +113,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen3-8B")
     parser.add_argument("--kv-dtype", default="fp8", choices=["fp8", "turboquant_4bit", "auto"])
+    parser.add_argument("--attention-backend", default=None)
+    parser.add_argument("--enforce-eager", action="store_true", default=False)
+    parser.add_argument("--no-chunked-prefill", action="store_true", default=False)
     parser.add_argument("--output", default=None)
     parser.add_argument("--max-model-len", type=int, default=16384)
     parser.add_argument("--gpu-util", type=float, default=0.85)
@@ -130,10 +133,16 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"Backend  : {args.kv_dtype}")
+    print(f"Attention: {args.attention_backend or 'auto'}")
     print(f"Model    : {args.model}")
     print(f"Max len  : {args.max_model_len}")
     print(f"GPU util : {args.gpu_util}")
+    print(f"Chunked  : {not args.no_chunked_prefill}")
     print(f"{'='*60}")
+
+    import os
+    if args.attention_backend:
+        os.environ["VLLM_ATTENTION_BACKEND"] = args.attention_backend
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     llm = LLM(
@@ -142,6 +151,8 @@ def main():
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_util,
         enable_prefix_caching=False,
+        enforce_eager=args.enforce_eager,
+        enable_chunked_prefill=not args.no_chunked_prefill,
     )
 
     results = []
