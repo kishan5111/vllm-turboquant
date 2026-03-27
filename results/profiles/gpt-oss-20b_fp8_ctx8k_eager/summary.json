@@ -1,0 +1,98 @@
+{
+  "total_self_cuda_us": 2452038.633,
+  "categories": [
+    {
+      "category": "moe_ffn_routing",
+      "self_cuda_us": 1603615.845,
+      "share_pct": 65.4
+    },
+    {
+      "category": "other",
+      "self_cuda_us": 384168.904,
+      "share_pct": 15.67
+    },
+    {
+      "category": "attention_kv",
+      "self_cuda_us": 209361.0,
+      "share_pct": 8.54
+    },
+    {
+      "category": "other_gemm",
+      "self_cuda_us": 179167.0,
+      "share_pct": 7.31
+    },
+    {
+      "category": "embedding_logits",
+      "self_cuda_us": 41860.0,
+      "share_pct": 1.71
+    },
+    {
+      "category": "norm",
+      "self_cuda_us": 33865.884,
+      "share_pct": 1.38
+    }
+  ],
+  "top_ops": [
+    {
+      "name": "vllm::moe_forward",
+      "self_cuda_us": 767468.0,
+      "share_pct": 31.3
+    },
+    {
+      "name": "_matmul_ogs_NNT_bf16xbf16xmxfp4_128x256x128x1_swiglu...",
+      "self_cuda_us": 358703.0,
+      "share_pct": 14.63
+    },
+    {
+      "name": "_matmul_ogs_NNT_bf16xbf16xmxfp4_128x256x128x1",
+      "self_cuda_us": 190227.0,
+      "share_pct": 7.76
+    },
+    {
+      "name": "_vllm_fa3_C::fwd",
+      "self_cuda_us": 163924.0,
+      "share_pct": 6.69
+    },
+    {
+      "name": "aten::addmm",
+      "self_cuda_us": 152639.0,
+      "share_pct": 6.22
+    },
+    {
+      "name": "_reduce",
+      "self_cuda_us": 108074.0,
+      "share_pct": 4.41
+    },
+    {
+      "name": "nvjet_tst_192x192_64x4_1x2_h_bz_coopB_bias_TNN",
+      "self_cuda_us": 106762.0,
+      "share_pct": 4.35
+    },
+    {
+      "name": "void cutlass::device_kernel<flash::enable_sm90_or_la...",
+      "self_cuda_us": 100978.0,
+      "share_pct": 4.12
+    },
+    {
+      "name": "_matmul_ogs_NNT_bf16xbf16xmxfp4_16x256x128x1_swiglu",
+      "self_cuda_us": 59048.0,
+      "share_pct": 2.41
+    },
+    {
+      "name": "_matmul_ogs_NNT_bf16xbf16xmxfp4_16x256x128x1",
+      "self_cuda_us": 36110.0,
+      "share_pct": 1.47
+    },
+    {
+      "name": "_C::fused_add_rms_norm",
+      "self_cuda_us": 32980.0,
+      "share_pct": 1.35
+    },
+    {
+      "name": "std::enable_if<(((8)>(0)))&&vllm::_typeConvert<c10::...",
+      "self_cuda_us": 32980.0,
+      "share_pct": 1.35
+    }
+  ],
+  "kv_dtype": "fp8"
+}

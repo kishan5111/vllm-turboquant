@@ -49,6 +49,7 @@ from vllm.triton_utils import tl, triton
 def _turboquant_pack_kernel(
     kv_ptr,            # [num_tokens, num_heads, head_size]  BF16/FP16  (rotated)
     cache_ptr,         # [num_blocks, num_kv_heads, block_size, comp_head]  UINT8
+    rot_ptr,           # [head_size, head_size] BF16/FP16 or unused
     slot_ptr,          # [num_tokens]  INT64 slot indices
     num_heads,         # runtime int
     block_size,        # runtime int
@@ -57,8 +58,11 @@ def _turboquant_pack_kernel(
     stride_cb: tl.int64,  # cache_ptr: stride over blocks
     stride_cp: tl.int64,  # cache_ptr: stride over page positions
     stride_ch: tl.int64,  # cache_ptr: stride over heads
+    stride_r0: tl.int64,
+    stride_r1: tl.int64,
     HEAD_SIZE: tl.constexpr,   # must be even and ≥ 2
     COMP_HEAD: tl.constexpr,   # HEAD_SIZE // 2 + 2
+    ROTATE_INPUT: tl.constexpr,
 ):
     """Pack one (token, head) pair into the compressed cache slot."""
     pid_t = tl.program_id(0)   # token index
@@ -76,9 +80,45 @@ def _turboquant_pack_kernel(
 
     src_base = pid_t * stride_t + pid_h * stride_h
 
-    # Load first half and second half of the rotated head vector.
-    lo_fp = tl.load(kv_ptr + src_base + half_offs).to(tl.float32)
-    hi_fp = tl.load(kv_ptr + src_base + half_offs + HALF).to(tl.float32)
+    # Load first half and second half of the rotated head vector. When
+    # ROTATE_INPUT=True, perform x @ R inside the pack kernel so the backend
+    # no longer pays an eager PyTorch matmul before packing.
+    lo_in = tl.load(kv_ptr + src_base + half_offs).to(tl.float32)
+    hi_in = tl.load(kv_ptr + src_base + half_offs + HALF).to(tl.float32)
+
+    if ROTATE_INPUT:
+        r00 = tl.load(
+            rot_ptr
+            + half_offs[:, None] * stride_r0
+            + half_offs[None, :] * stride_r1,
+        ).to(tl.float32)
+        r01 = tl.load(
+            rot_ptr
+            + half_offs[:, None] * stride_r0
+            + (HALF + half_offs)[None, :] * stride_r1,
+        ).to(tl.float32)
+        r10 = tl.load(
+            rot_ptr
+            + (HALF + half_offs)[:, None] * stride_r0
+            + half_offs[None, :] * stride_r1,
+        ).to(tl.float32)
+        r11 = tl.load(
+            rot_ptr
+            + (HALF + half_offs)[:, None] * stride_r0
+            + (HALF + half_offs)[None, :] * stride_r1,
+        ).to(tl.float32)
+
+        lo_fp = (
+            tl.sum(lo_in[:, None] * r00, axis=0)
+            + tl.sum(hi_in[:, None] * r10, axis=0)
+        )
+        hi_fp = (
+            tl.sum(lo_in[:, None] * r01, axis=0)
+            + tl.sum(hi_in[:, None] * r11, axis=0)
+        )
+    else:
+        lo_fp = lo_in
+        hi_fp = hi_in
 
     # Per-head scale = max absolute value.  Maps [-scale, +scale] ↔ [0, 15].
     abs_max = tl.maximum(tl.max(tl.abs(lo_fp)), tl.max(tl.abs(hi_fp)))
@@ -113,8 +153,14 @@ def turboquant_compress_kv(
     key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, block_size, comp_head]  UINT8
     value_cache: torch.Tensor,
     slot_mapping: torch.Tensor,  # [num_tokens]  INT64
+    key_rotation: torch.Tensor | None = None,
+    value_rotation: torch.Tensor | None = None,
 ) -> None:
-    """Compress rotated K/V tensors into the uint8 KV cache in-place."""
+    """Compress K/V tensors into the uint8 KV cache in-place.
+
+    When key_rotation/value_rotation are provided, the corresponding tensor is
+    rotated inside the Triton pack kernel before quantisation and packing.
+    """
     num_tokens, num_heads, head_size = key_rot.shape
     # Cache layout: [num_blocks, num_kv_heads, block_size, comp_head]
     block_size = key_cache.shape[2]   # block_size is now dim 2
@@ -134,6 +180,7 @@ def turboquant_compress_kv(
     _turboquant_pack_kernel[grid](
         kv_ptr=key_rot,
         cache_ptr=key_cache,
+        rot_ptr=key_rotation if key_rotation is not None else key_rot,
         slot_ptr=slot_mapping,
         num_heads=num_heads,
         block_size=block_size,
@@ -142,8 +189,11 @@ def turboquant_compress_kv(
         stride_cb=key_cache.stride(0),
         stride_cp=key_cache.stride(2),   # position is now dim 2
         stride_ch=key_cache.stride(1),   # kv-head is now dim 1
+        stride_r0=(key_rotation.stride(0) if key_rotation is not None else 0),
+        stride_r1=(key_rotation.stride(1) if key_rotation is not None else 0),
         HEAD_SIZE=head_size,
         COMP_HEAD=comp_head,
+        ROTATE_INPUT=(key_rotation is not None),
         num_warps=4,
         num_stages=1,
     )
@@ -151,6 +201,7 @@ def turboquant_compress_kv(
     _turboquant_pack_kernel[grid](
         kv_ptr=value_rot,
         cache_ptr=value_cache,
+        rot_ptr=value_rotation if value_rotation is not None else value_rot,
         slot_ptr=slot_mapping,
         num_heads=num_heads,
         block_size=block_size,
@@ -159,8 +210,11 @@ def turboquant_compress_kv(
         stride_cb=value_cache.stride(0),
         stride_cp=value_cache.stride(2),   # position is now dim 2
         stride_ch=value_cache.stride(1),   # kv-head is now dim 1
+        stride_r0=(value_rotation.stride(0) if value_rotation is not None else 0),
+        stride_r1=(value_rotation.stride(1) if value_rotation is not None else 0),
         HEAD_SIZE=head_size,
         COMP_HEAD=comp_head,
+        ROTATE_INPUT=(value_rotation is not None),
         num_warps=4,
         num_stages=1,
     )

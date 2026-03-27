@@ -1,0 +1,50 @@
+{
+  "config": {
+    "model": "openai/gpt-oss-20b",
+    "kv_dtype": "fp8",
+    "attention_backend": null,
+    "enforce_eager": false,
+    "no_chunked_prefill": false,
+    "output": "results/gpt-oss-20b_fp8_gate.json",
+    "max_model_len": 32768,
+    "gpu_util": 0.85,
+    "workloads": [
+      "ctx8k",
+      "ctx16k"
+    ],
+    "profile_turboquant_paths": false,
+    "cudagraph_mode": "auto"
+  },
+  "resolved_cudagraph_mode": "full_decode_only",
+  "results": [
+    {
+      "workload": "ctx8k",
+      "backend": "fp8",
+      "num_requests": 8,
+      "input_len": 8192,
+      "output_len": 64,
+      "total_time_s": 4.252,
+      "total_output_tokens": 512,
+      "output_tok_per_s": 120.4,
+      "request_per_s": 1.88,
+      "p99_latency_s": 0,
+      "peak_vram_gb": 0.0,
+      "effective_kv_bytes_per_token": 2048
+    },
+    {
+      "workload": "ctx16k",
+      "backend": "fp8",
+      "num_requests": 4,
+      "input_len": 16384,
+      "output_len": 64,
+      "total_time_s": 1.357,
+      "total_output_tokens": 256,
+      "output_tok_per_s": 188.6,
+      "request_per_s": 2.95,
+      "p99_latency_s": 0,
+      "peak_vram_gb": 0.0,
+      "effective_kv_bytes_per_token": 2048
+    }
+  ],
+  "profile": []
+}

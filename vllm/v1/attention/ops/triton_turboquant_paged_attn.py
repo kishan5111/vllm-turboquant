@@ -63,9 +63,10 @@ _SM_COUNT: int = int(_os.environ.get("TURBOQUANT_SM_COUNT", "132"))
 
 @triton.jit
 def _tq_split_kv_kernel(
-    q_rot_ptr,      # [num_seqs, num_q_heads, HEAD_SIZE]  bf16
+    q_ptr,          # [num_seqs, num_q_heads, HEAD_SIZE]  bf16
     k_cache_ptr,    # [num_blocks, num_kv_heads, block_size, COMP_HEAD]  uint8  AoS layout
     v_cache_ptr,    #   same shape
+    rot_ptr,        # [HEAD_SIZE, HEAD_SIZE] bf16/fp16 or unused when Q_IS_ROTATED=True
     bt_ptr,         # [num_seqs, MAX_BLOCKS]  int32
     lens_ptr,       # [num_seqs]  int32
     # outputs:
@@ -78,6 +79,8 @@ def _tq_split_kv_kernel(
     # strides
     stride_q_s: tl.int64,
     stride_q_h: tl.int64,
+    stride_r0: tl.int64,
+    stride_r1: tl.int64,
     stride_c_b: tl.int64,   # block stride
     stride_c_h: tl.int64,   # kv-head stride
     stride_c_p: tl.int64,   # position stride = COMP_HEAD = HALF+2 = 66
@@ -102,6 +105,7 @@ def _tq_split_kv_kernel(
     KV_SPLITS:         tl.constexpr,
     WRITE_DIRECT:      tl.constexpr,  # True → normalise + write output, skip merge
     USE_BT_PREFETCH:   tl.constexpr,  # preload all bt entries to break load-dep chain
+    Q_IS_ROTATED:      tl.constexpr,
 ):
     seq     = tl.program_id(0)
     kv_head = tl.program_id(1)   # iterates over KV heads
@@ -116,23 +120,54 @@ def _tq_split_kv_kernel(
     # Load all GQA_RATIO Q heads for this KV head: [GQA_RATIO, HALF] each.
     # These are loaded ONCE and reused across all block iterations.
     q_group_base = seq * stride_q_s + kv_head * GQA_RATIO * stride_q_h
-    q_lo_grp = tl.load(
-        q_rot_ptr + q_group_base
+    q_lo_in = tl.load(
+        q_ptr + q_group_base
         + gqa_offs[:, None] * stride_q_h
         + half_offs[None, :],
-    ).to(tl.float32)   # [GQA_RATIO, HALF]
-    q_hi_grp = tl.load(
-        q_rot_ptr + q_group_base
+    )
+    q_hi_in = tl.load(
+        q_ptr + q_group_base
         + gqa_offs[:, None] * stride_q_h
         + HALF + half_offs[None, :],
-    ).to(tl.float32)   # [GQA_RATIO, HALF]
+    )
 
-    # Per-Q-head online softmax state as 2D / 1D tensors.
-    # Row extraction (read): row_g = tl.sum(T * sel_g[:, None], axis=0)
-    # Row update  (write): T = tl.where(sel_g[:, None], new_row[None, :], T)
-    # where sel_g = (gqa_offs == g).to(tl.float32)  — a compile-time constant.
-    # With g from tl.static_range, sel_g is statically known; LLVM constant
-    # propagation eliminates all multiply-by-zero terms at compile time.
+    if Q_IS_ROTATED:
+        q_lo_grp = q_lo_in.to(tl.float32)
+        q_hi_grp = q_hi_in.to(tl.float32)
+    else:
+        r00 = tl.load(
+            rot_ptr
+            + half_offs[:, None] * stride_r0
+            + half_offs[None, :] * stride_r1,
+        ).to(q_lo_in.dtype)
+        r01 = tl.load(
+            rot_ptr
+            + half_offs[:, None] * stride_r0
+            + (HALF + half_offs)[None, :] * stride_r1,
+        ).to(q_lo_in.dtype)
+        r10 = tl.load(
+            rot_ptr
+            + (HALF + half_offs)[:, None] * stride_r0
+            + half_offs[None, :] * stride_r1,
+        ).to(q_lo_in.dtype)
+        r11 = tl.load(
+            rot_ptr
+            + (HALF + half_offs)[:, None] * stride_r0
+            + (HALF + half_offs)[None, :] * stride_r1,
+        ).to(q_lo_in.dtype)
+
+        q_lo_grp = (
+            tl.dot(q_lo_in, r00, input_precision="ieee")
+            + tl.dot(q_hi_in, r10, input_precision="ieee")
+        ).to(tl.float32)
+        q_hi_grp = (
+            tl.dot(q_lo_in, r01, input_precision="ieee")
+            + tl.dot(q_hi_in, r11, input_precision="ieee")
+        ).to(tl.float32)
+
+    # Per-Q-head online softmax state. Keep the full GQA group live as 2D / 1D
+    # tensors so GPT-OSS's GQA_RATIO=8 path can update every shared-Q head in
+    # one matrix-style step instead of an 8x scalar loop.
     m_grp    = tl.full([GQA_RATIO], -1e38, dtype=tl.float32)
     l_grp    = tl.zeros([GQA_RATIO], dtype=tl.float32)
     acc_lo_g = tl.zeros([GQA_RATIO, HALF], dtype=tl.float32)
@@ -221,47 +256,33 @@ def _tq_split_kv_kernel(
         v_lo = (v_packed & 0x0F).to(tl.float16) * vs_scale[:, None] - vs[:, None]  # [BS, HALF] fp16
         v_hi = ((v_packed >> 4) & 0x0F).to(tl.float16) * vs_scale[:, None] - vs[:, None]
 
-        # ---- Per-Q-head softmax + accumulation (compile-time unrolled) ----
-        # k_lo, k_hi, v_lo, v_hi are shared across all g iterations.
-        # Q extraction uses a compile-time-constant mask; LLVM propagates the
-        # constant and eliminates all multiply-by-zero terms.
-        for g in tl.static_range(GQA_RATIO):
-            sel_g  = (gqa_offs == g).to(tl.float32)   # [GQA_RATIO] — compile-time const
+        # ---- Group softmax + accumulation ----
+        # Process the entire GQA group in one matrix-style update. This avoids
+        # the previous compile-time-unrolled per-head masked loop, which is
+        # especially costly for GPT-OSS where GQA_RATIO=8.
+        scores = (
+            tl.dot(q_lo_grp.to(k_lo.dtype), tl.trans(k_lo), input_precision="ieee")
+            + tl.dot(q_hi_grp.to(k_hi.dtype), tl.trans(k_hi), input_precision="ieee")
+        ).to(tl.float32) * attn_scale                            # [GQA_RATIO, BLOCK_SIZE]
+        scores = tl.where(valid[None, :], scores, -1e38)
 
-            q_lo_g = tl.sum(q_lo_grp * sel_g[:, None], axis=0)  # [HALF]
-            q_hi_g = tl.sum(q_hi_grp * sel_g[:, None], axis=0)  # [HALF]
+        block_max = tl.max(scores, axis=1)                       # [GQA_RATIO]
+        m_new     = tl.maximum(m_grp, block_max)
+        alpha     = tl.exp(m_grp - m_new)                        # [GQA_RATIO]
+        exp_sc    = tl.exp(scores - m_new[:, None])              # [GQA_RATIO, BLOCK_SIZE]
+        exp_sc    = tl.where(valid[None, :], exp_sc, 0.0)
 
-            scores_g = (
-                tl.sum(k_lo.to(tl.float32) * q_lo_g[None, :], axis=1)
-                + tl.sum(k_hi.to(tl.float32) * q_hi_g[None, :], axis=1)
-            ) * attn_scale             # [BLOCK_SIZE]
-            scores_g = tl.where(valid, scores_g, -1e38)
+        delta_lo = tl.dot(exp_sc.to(v_lo.dtype), v_lo, input_precision="ieee").to(
+            tl.float32
+        )                                                        # [GQA_RATIO, HALF]
+        delta_hi = tl.dot(exp_sc.to(v_hi.dtype), v_hi, input_precision="ieee").to(
+            tl.float32
+        )                                                        # [GQA_RATIO, HALF]
 
-            m_g      = tl.sum(m_grp * sel_g)           # scalar
-            l_g      = tl.sum(l_grp * sel_g)           # scalar
-
-            block_max_g = tl.max(scores_g, axis=0)
-            m_new_g     = tl.maximum(m_g, block_max_g)
-            alpha_g     = tl.exp(m_g - m_new_g)
-            exp_sc_g    = tl.exp(scores_g - m_new_g)
-            exp_sc_g    = tl.where(valid, exp_sc_g, 0.0)
-
-            acc_lo_g_curr = tl.sum(acc_lo_g * sel_g[:, None], axis=0)  # [HALF]
-            acc_hi_g_curr = tl.sum(acc_hi_g * sel_g[:, None], axis=0)  # [HALF]
-
-            delta_lo = tl.sum(exp_sc_g[:, None] * v_lo.to(tl.float32), axis=0)  # [HALF]
-            delta_hi = tl.sum(exp_sc_g[:, None] * v_hi.to(tl.float32), axis=0)  # [HALF]
-
-            acc_lo_new = acc_lo_g_curr * alpha_g + delta_lo
-            acc_hi_new = acc_hi_g_curr * alpha_g + delta_hi
-            l_new_g    = l_g * alpha_g + tl.sum(exp_sc_g)
-
-            # Update state at row g using tl.where
-            sel_b = (gqa_offs == g)   # [GQA_RATIO] bool
-            m_grp    = tl.where(sel_b, m_new_g,               m_grp)
-            l_grp    = tl.where(sel_b, l_new_g,               l_grp)
-            acc_lo_g = tl.where(sel_b[:, None], acc_lo_new[None, :], acc_lo_g)
-            acc_hi_g = tl.where(sel_b[:, None], acc_hi_new[None, :], acc_hi_g)
+        acc_lo_g = acc_lo_g * alpha[:, None] + delta_lo
+        acc_hi_g = acc_hi_g * alpha[:, None] + delta_hi
+        l_grp    = l_grp * alpha + tl.sum(exp_sc, axis=1)
+        m_grp    = m_new
 
     # Write results for all GQA Q heads.
     for g in tl.static_range(GQA_RATIO):
@@ -370,11 +391,15 @@ def _adaptive_kv_splits(num_seqs: int, num_kv_heads: int,
       • kv_splits=1 → WRITE_DIRECT fast path (no merge kernel at all).
     """
     progs  = num_seqs * num_kv_heads
-    target = _SM_COUNT * 32          # ~4224 programs for H100 (ensures p2=32 at medium ctx)
+
+    target = _SM_COUNT * 32          # ~4224 programs for H100
     needed = max(1, (target + progs - 1) // progs)
-    # At large context (>512 blocks ≈ ctx>8K) extra splits cost more in merge
-    # kernel overhead than they save in decode parallelism.  Cap at 16 there.
-    hard_cap = 16 if max_blocks > 512 else 32
+    # GPT-OSS/H100 sweeps favor fewer splits at ~8k (512 blocks) but more
+    # splits again once per-sequence context reaches ~16k (1024 blocks).
+    if max_blocks >= 1024:
+        hard_cap = 32
+    else:
+        hard_cap = 16
     capped = min(needed, hard_cap)
 
     p2 = 1
@@ -393,6 +418,10 @@ def turboquant_fused_paged_decode(
     scale:       float,
     kv_splits:   int | None = None,   # None → auto-tune per batch/GPU
     skip_output_inverse_rotation: bool = False,
+    rotate_inside_decode: bool = False,
+    split_num_warps: int | None = None,
+    split_num_stages: int | None = None,
+    merge_num_warps: int | None = None,
 ) -> torch.Tensor:                    # [num_seqs, num_q_heads, head_size]  BF16/FP16
     """Fused TurboQuant paged decode — GQA-fused split-KV + AoS cache layout.
 
@@ -436,13 +465,15 @@ def turboquant_fused_paged_decode(
     use_bt_prefetch = (bps_pow2 <= 64)
 
     dtype = query.dtype
-    rotation = rotation.to(dtype)
-    # Use BF16 tensor-core path for Q rotation (2× faster than FP32 scalar BLAS).
-    # Precision: BF16 has 7-bit mantissa; quantisation error is ~4-bit (25×
-    # larger), so BF16 rotation introduces negligible extra error.
-    q_rot = (query.reshape(-1, head_size) @ rotation).reshape(
-        num_seqs, num_q_heads, head_size
-    ).contiguous()
+    rotation = rotation.to(dtype).contiguous()
+    q_input = query.contiguous()
+    q_is_rotated = not rotate_inside_decode
+    if q_is_rotated:
+        # Use the legacy eager path when explicitly requested by tests or
+        # benchmarks. The backend uses rotate_inside_decode=True.
+        q_input = (query.reshape(-1, head_size) @ rotation).reshape(
+            num_seqs, num_q_heads, head_size
+        ).contiguous()
 
     # Allocate partial buffers (used when kv_splits > 1).
     # When write_direct=True these are zero-size placeholders — the kernel
@@ -480,19 +511,30 @@ def turboquant_fused_paged_decode(
         dtype=torch.bfloat16, device=query.device,
     )
 
-    # Num warps: 4 is generally best; bump to 8 for large KV chunks.
-    num_warps = 8 if blocks_per_split >= 64 else 4
-    # Long-context decode can become occupancy-limited if we pipeline too many
-    # K/V blocks at once. Back off staging for larger splits to reduce
-    # register pressure in the bandwidth-bound regime.
-    # Drop to num_stages=2 for very large per-program KV chunks (≥128 blocks)
-    # to reduce register pressure in bandwidth-bound long-context regime.
-    num_stages = 2 if blocks_per_split >= 128 else 4
+    # H100/GPT-OSS tuning: 4 split warps consistently wins in the 8k/16k
+    # decode region we care about, even when blocks_per_split reaches 64.
+    num_warps = (
+        split_num_warps
+        if split_num_warps is not None
+        else 4
+    )
+    # Tune staging by per-program KV chunk size. Smaller chunks benefit from
+    # deeper pipelining; longer chunks need lower register pressure.
+    num_stages = (
+        split_num_stages
+        if split_num_stages is not None
+        else (
+            1 if blocks_per_split >= 128
+            else 2 if blocks_per_split >= 64
+            else 3
+        )
+    )
 
     _tq_split_kv_kernel[(num_seqs, num_kv_heads, kv_splits)](
-        q_rot, key_cache, value_cache, block_table, seq_lens,
+        q_input, key_cache, value_cache, rotation, block_table, seq_lens,
         partial_acc, partial_m, partial_l, out_direct,
-        q_rot.stride(0),    q_rot.stride(1),
+        q_input.stride(0), q_input.stride(1),
+        rotation.stride(0), rotation.stride(1),
         key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),  # block, head, position
         block_table.stride(0),
         s_oa_s, s_oa_h, s_oa_k,
@@ -510,6 +552,7 @@ def turboquant_fused_paged_decode(
         KV_SPLITS=kv_splits,
         WRITE_DIRECT=write_direct,
         USE_BT_PREFETCH=use_bt_prefetch,
+        Q_IS_ROTATED=q_is_rotated,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -523,8 +566,12 @@ def turboquant_fused_paged_decode(
             (num_seqs, num_q_heads, head_size),
             dtype=torch.bfloat16, device=query.device,
         )
-        # Scale merge warps with kv_splits: more splits → more reductions.
-        merge_warps = 4 if kv_splits <= 8 else 8
+        # H100 sweeps favored 4 merge warps across the GPT-OSS gate workloads.
+        merge_warps = (
+            merge_num_warps
+            if merge_num_warps is not None
+            else 4
+        )
         _tq_merge_splits_kernel[(num_seqs, num_q_heads)](
             partial_acc, partial_m, partial_l, out_rot,
             s_oa_s, s_oa_h, s_oa_k,

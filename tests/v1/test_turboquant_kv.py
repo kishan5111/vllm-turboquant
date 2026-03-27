@@ -46,7 +46,8 @@ class TestTurboQuantTritonKernels:
 
     @pytest.mark.parametrize("head_size", [64, 128, 256])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-    def test_compress_decompress_roundtrip(self, head_size, dtype):
+    @pytest.mark.parametrize("use_fused_rotation", [False, True])
+    def test_compress_decompress_roundtrip(self, head_size, dtype, use_fused_rotation):
         """Decompressed values must be close to original rotated values."""
         from vllm.v1.attention.ops.triton_turboquant_kv import (
             make_turboquant_rotation,
@@ -86,7 +87,15 @@ class TestTurboQuantTritonKernels:
         slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
 
         # Compress
-        turboquant_compress_kv(key_rot, value_rot, key_cache, value_cache, slot_mapping)
+        turboquant_compress_kv(
+            key if use_fused_rotation else key_rot,
+            value if use_fused_rotation else value_rot,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            key_rotation=R if use_fused_rotation else None,
+            value_rotation=R if use_fused_rotation else None,
+        )
 
         # Decompress all blocks
         block_ids = torch.arange(num_blocks, dtype=torch.int64, device=device)
@@ -288,7 +297,8 @@ class TestTurboQuantFusedDecodeKernel:
     def _require_cuda(self):
         _skip_if_no_cuda()
 
-    def test_fused_decode_matches_unfused(self):
+    @pytest.mark.parametrize("rotate_inside_decode", [False, True])
+    def test_fused_decode_matches_unfused(self, rotate_inside_decode):
         """Fused decode kernel output should match decompress+flash_attn."""
         from vllm.v1.attention.ops.triton_turboquant_paged_attn import (
             turboquant_fused_paged_decode,
@@ -379,6 +389,7 @@ class TestTurboQuantFusedDecodeKernel:
             seq_lens=seq_lens,
             rotation=R,
             scale=scale,
+            rotate_inside_decode=rotate_inside_decode,
         )
 
         cos = torch.nn.functional.cosine_similarity(
@@ -388,6 +399,71 @@ class TestTurboQuantFusedDecodeKernel:
 
         print(f"\nFused vs unfused cosine similarity: {cos:.5f}")
         assert cos > 0.98, f"Fused decode kernel output mismatch: cos={cos:.5f}"
+
+    def test_fused_decode_gpt_oss_topology(self):
+        """Exercise the GQA=8 GPT-OSS attention geometry on the fused path."""
+        from vllm.v1.attention.ops.triton_turboquant_paged_attn import (
+            turboquant_fused_paged_decode,
+        )
+        from vllm.v1.attention.ops.triton_turboquant_kv import (
+            make_turboquant_rotation,
+        )
+
+        device = "cuda"
+        dtype = torch.bfloat16
+        num_seqs = 2
+        num_q_heads = 64
+        num_kv_heads = 8
+        head_size = 64
+        block_size = 16
+        seq_len = 128
+        num_blocks_per_seq = math.ceil(seq_len / block_size)
+        total_blocks = num_blocks_per_seq * num_seqs + 4
+        comp_head = head_size // 2 + 2
+
+        key_cache = torch.randint(
+            0, 256,
+            (total_blocks, num_kv_heads, block_size, comp_head),
+            dtype=torch.uint8,
+            device=device,
+        )
+        value_cache = torch.randint_like(key_cache, 0, 256)
+        query = torch.randn(
+            num_seqs,
+            num_q_heads,
+            head_size,
+            dtype=dtype,
+            device=device,
+        )
+        block_table = torch.zeros(
+            num_seqs,
+            num_blocks_per_seq,
+            dtype=torch.int32,
+            device=device,
+        )
+        for seq_idx in range(num_seqs):
+            block_table[seq_idx] = torch.arange(
+                seq_idx * num_blocks_per_seq,
+                (seq_idx + 1) * num_blocks_per_seq,
+                dtype=torch.int32,
+                device=device,
+            )
+
+        seq_lens = torch.full((num_seqs,), seq_len, dtype=torch.int32, device=device)
+        R = make_turboquant_rotation(head_size, dtype, torch.device(device), seed=7)
+        out = turboquant_fused_paged_decode(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=block_table,
+            seq_lens=seq_lens,
+            rotation=R,
+            scale=head_size ** -0.5,
+            skip_output_inverse_rotation=True,
+            rotate_inside_decode=True,
+        )
+        assert out.shape == query.shape
+        assert torch.isfinite(out.float()).all()
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +585,56 @@ class TestQwen3TurboQuantE2E:
             assert keyword in combined, (
                 f"Expected keyword {keyword!r} not found in output: {output!r}"
             )
+
+
+@pytest.mark.skipif(
+    os.environ.get("TURBOQUANT_SKIP_GPT_OSS_E2E", "1") == "1",
+    reason="Set TURBOQUANT_SKIP_GPT_OSS_E2E=0 to run the GPT-OSS-20B correctness check",
+)
+class TestGptOssTurboQuantE2E:
+    """Greedy top-1 correctness check for GPT-OSS-20B."""
+
+    MODEL = os.environ.get("TURBOQUANT_GPT_OSS_MODEL", "openai/gpt-oss-20b")
+    PROMPTS = [
+        "Summarize the key idea behind mixture-of-experts models in one paragraph.",
+        "Write a concise explanation of why long-context KV cache bandwidth matters.",
+    ]
+
+    @pytest.fixture(autouse=True)
+    def _require_cuda(self):
+        _skip_if_no_cuda()
+        if torch.cuda.get_device_capability()[0] < 8:
+            pytest.skip("Requires Ampere (sm_80) or newer GPU")
+
+    def _run_vllm(self, cache_dtype: str):
+        from vllm import LLM, SamplingParams
+
+        llm = LLM(
+            model=self.MODEL,
+            kv_cache_dtype=cache_dtype,
+            max_model_len=32768,
+            gpu_memory_utilization=0.85,
+            enable_prefix_caching=False,
+            enforce_eager=False,
+            enable_chunked_prefill=True,
+        )
+        outputs = llm.generate(
+            self.PROMPTS,
+            SamplingParams(
+                temperature=0.0,
+                max_tokens=16,
+                ignore_eos=True,
+            ),
+        )
+        token_ids = [o.outputs[0].token_ids[:16] for o in outputs]
+        del llm
+        torch.cuda.empty_cache()
+        return token_ids
+
+    def test_greedy_top1_matches_fp8(self):
+        fp8_tokens = self._run_vllm("fp8")
+        tq_tokens = self._run_vllm("turboquant_4bit")
+        assert tq_tokens == fp8_tokens
 
 
 # ---------------------------------------------------------------------------

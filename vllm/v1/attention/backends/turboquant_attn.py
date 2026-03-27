@@ -17,6 +17,7 @@ During the forward pass:
 Reference: Zandieh et al., arXiv 2504.19874 (ICLR 2026).
 """
 
+import os
 from dataclasses import replace
 from typing import ClassVar
 
@@ -420,6 +421,9 @@ class TurboQuantAttentionImpl(FlashAttentionImpl):
         _turboquant_layer_counter += 1
         self._rotation_seed: int = _turboquant_layer_counter
         self._rotation: torch.Tensor | None = None
+        self._rotate_inside_decode = (
+            os.environ.get("TURBOQUANT_ROTATE_INSIDE_DECODE", "0") == "1"
+        )
         self._value_output_folded = False
         self._qjl_proj_score: torch.Tensor | None = None
         self._qjl_proj_quant: torch.Tensor | None = None
@@ -488,15 +492,13 @@ class TurboQuantAttentionImpl(FlashAttentionImpl):
 
         R = self._get_rotation(key.dtype, key.device)
 
-        # Keys always need rotation. Values can stay in rotated space when
-        # V/output folding is enabled at model-load time.
-        key_rot = apply_rotation(key, R)     # [num_tokens, num_kv_heads, D]
-        value_rot = value if self._value_output_folded else apply_rotation(value, R)
-
         turboquant_compress_kv(
-            key_rot, value_rot,
+            key,
+            value,
             key_cache, value_cache,
             slot_mapping,
+            key_rotation=R,
+            value_rotation=None if self._value_output_folded else R,
         )
 
     def _do_qjl_kv_cache_update(
@@ -672,16 +674,11 @@ class TurboQuantAttentionImpl(FlashAttentionImpl):
         turboquant_decompress_blocks(comp_key_cache, unique_blk_ids, decomp_key)
         turboquant_decompress_blocks(comp_value_cache, unique_blk_ids, decomp_value)
 
-        # Restore keys to the original space for FlashAttention. Values can
-        # stay rotated when the output projection has been folded.
+        # Keep decompressed K/V in rotated space and rotate the current query
+        # chunk once. For long-context prefill this is much cheaper than
+        # derotating every referenced KV block back to the original basis.
         R = self._get_rotation(query.dtype, query.device)
-        decomp_key_flat   = decomp_key.reshape(-1, self._real_head_size)
-        decomp_key_flat   = decomp_key_flat   @ R.T
-        decomp_key   = decomp_key_flat.reshape(decomp_key.shape)
-        if not self._value_output_folded:
-            decomp_value_flat = decomp_value.reshape(-1, self._real_head_size)
-            decomp_value_flat = decomp_value_flat @ R.T
-            decomp_value = decomp_value_flat.reshape(decomp_value.shape)
+        query_rot = apply_rotation(query, R)
 
         # ---- 3. Remap block_table to indices in [0, num_unique) ----
         if num_unique > 0:
@@ -711,7 +708,7 @@ class TurboQuantAttentionImpl(FlashAttentionImpl):
 
         result = super().forward(
             layer=layer,
-            query=query,
+            query=query_rot,
             key=key,
             value=value,
             kv_cache=fake_kv_cache,
@@ -722,6 +719,9 @@ class TurboQuantAttentionImpl(FlashAttentionImpl):
         )
 
         self.kv_cache_dtype = orig_dtype
+        if not self._value_output_folded:
+            num_actual = attn_metadata.num_actual_tokens
+            result[:num_actual].copy_(apply_rotation(result[:num_actual], R.T))
         return result
 
     def _qjl_metadata_has_prefix(self, attn_metadata: FlashAttentionMetadata) -> bool:
@@ -755,6 +755,7 @@ class TurboQuantAttentionImpl(FlashAttentionImpl):
             rotation=R,
             scale=self.scale,
             skip_output_inverse_rotation=self._value_output_folded,
+            rotate_inside_decode=self._rotate_inside_decode,
         )
 
         output[:num_actual].copy_(result)

@@ -1,0 +1,98 @@
+{
+  "total_self_cuda_us": 18641680.087,
+  "categories": [
+    {
+      "category": "attention_kv",
+      "self_cuda_us": 16390716.0,
+      "share_pct": 87.93
+    },
+    {
+      "category": "moe_ffn_routing",
+      "self_cuda_us": 1594881.43,
+      "share_pct": 8.56
+    },
+    {
+      "category": "other",
+      "self_cuda_us": 393534.197,
+      "share_pct": 2.11
+    },
+    {
+      "category": "other_gemm",
+      "self_cuda_us": 186821.0,
+      "share_pct": 1.0
+    },
+    {
+      "category": "embedding_logits",
+      "self_cuda_us": 41798.0,
+      "share_pct": 0.22
+    },
+    {
+      "category": "norm",
+      "self_cuda_us": 33929.46,
+      "share_pct": 0.18
+    }
+  ],
+  "top_ops": [
+    {
+      "name": "vllm::unified_attention_with_output",
+      "self_cuda_us": 8062000.0,
+      "share_pct": 43.25
+    },
+    {
+      "name": "_tq_split_kv_kernel",
+      "self_cuda_us": 8010000.0,
+      "share_pct": 42.97
+    },
+    {
+      "name": "vllm::moe_forward",
+      "self_cuda_us": 758813.0,
+      "share_pct": 4.07
+    },
+    {
+      "name": "_matmul_ogs_NNT_bf16xbf16xmxfp4_128x256x128x1_swiglu...",
+      "self_cuda_us": 354508.0,
+      "share_pct": 1.9
+    },
+    {
+      "name": "_matmul_ogs_NNT_bf16xbf16xmxfp4_128x256x128x1",
+      "self_cuda_us": 187691.0,
+      "share_pct": 1.01
+    },
+    {
+      "name": "aten::addmm",
+      "self_cuda_us": 152664.0,
+      "share_pct": 0.82
+    },
+    {
+      "name": "_vllm_fa3_C::fwd",
+      "self_cuda_us": 121542.0,
+      "share_pct": 0.65
+    },
+    {
+      "name": "_reduce",
+      "self_cuda_us": 107544.0,
+      "share_pct": 0.58
+    },
+    {
+      "name": "void cutlass::device_kernel<flash::enable_sm90_or_la...",
+      "self_cuda_us": 106774.0,
+      "share_pct": 0.57
+    },
+    {
+      "name": "nvjet_tst_192x192_64x4_1x2_h_bz_coopB_bias_TNN",
+      "self_cuda_us": 106749.0,
+      "share_pct": 0.57
+    },
+    {
+      "name": "vllm::unified_kv_cache_update",
+      "self_cuda_us": 72889.0,
+      "share_pct": 0.39
+    },
+    {
+      "name": "_turboquant_pack_kernel",
+      "self_cuda_us": 72889.0,
+      "share_pct": 0.39
+    }
+  ],
+  "kv_dtype": "turboquant_4bit"
+}
