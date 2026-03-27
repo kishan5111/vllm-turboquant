@@ -119,6 +119,29 @@ def _fold_local_v_proj_weight_(
     v_heads.copy_(folded)
 
 
+def _fold_separate_v_proj_weight_(
+    v_weight: torch.Tensor,
+    *,
+    num_kv_heads: int,
+    head_size: int,
+    rotation: torch.Tensor,
+) -> None:
+    """Fold rotation into a separate (non-fused) V projection weight.
+
+    V weight shape: [num_kv_heads * head_size, hidden_size]
+    Rotation is applied to the output (left) side: folded = R @ v_heads
+    where v_heads = v_weight.view(num_kv_heads, head_size, hidden_size).
+    """
+    if v_weight.shape[0] == 0:
+        return
+    v_heads = v_weight.view(num_kv_heads, head_size, -1)
+    folded = torch.matmul(
+        rotation.t().to(torch.float32).unsqueeze(0),
+        v_heads.to(torch.float32),
+    ).to(v_heads.dtype)
+    v_heads.copy_(folded)
+
+
 def _fold_local_o_proj_weight_(
     o_weight: torch.Tensor,
     *,
@@ -148,7 +171,11 @@ def maybe_fold_turboquant_value_output_projections(
     and the attention backend.
     """
     attn_layer = getattr(module, "attn", None)
+    if attn_layer is None:
+        return False
     impl = getattr(attn_layer, "impl", None)
+    if impl is None:
+        return False
     if not isinstance(impl, TurboQuantAttentionImpl):
         return False
     if impl._use_qjl:
@@ -156,17 +183,33 @@ def maybe_fold_turboquant_value_output_projections(
 
     qkv_proj = getattr(module, "qkv_proj", None)
     o_proj = getattr(module, "o_proj", None)
-    if qkv_proj is None or o_proj is None:
+    # GPT-OSS and some other models use separate q/k/v projections.
+    q_proj_separate = getattr(module, "q_proj", None)
+    v_proj_separate = getattr(module, "v_proj", None)
+    if qkv_proj is None and (q_proj_separate is None or v_proj_separate is None):
+        return False
+    if o_proj is None:
         return False
 
-    if not isinstance(getattr(qkv_proj, "quant_method", None), UnquantizedLinearMethod):
-        return False
-    if not isinstance(getattr(o_proj, "quant_method", None), UnquantizedLinearMethod):
+    if qkv_proj is not None:
+        qm = getattr(qkv_proj, "quant_method", None)
+        if qm is not None and not isinstance(qm, UnquantizedLinearMethod):
+            return False
+    o_qm = getattr(o_proj, "quant_method", None)
+    if o_qm is not None and not isinstance(o_qm, UnquantizedLinearMethod):
         return False
 
+    # Accept both "standard" names (num_heads/num_kv_heads) and GPT-OSS names
+    # (num_attention_heads / num_local_key_value_heads).
     head_size = getattr(module, "head_dim", None)
-    num_heads = getattr(module, "num_heads", None)
-    num_kv_heads = getattr(module, "num_kv_heads", None)
+    num_heads = (
+        getattr(module, "num_heads", None)
+        or getattr(module, "num_attention_heads", None)
+    )
+    num_kv_heads = (
+        getattr(module, "num_kv_heads", None)
+        or getattr(module, "num_local_key_value_heads", None)
+    )
     if not all(isinstance(v, int) for v in (head_size, num_heads, num_kv_heads)):
         return False
     if head_size != impl._real_head_size:
@@ -174,24 +217,34 @@ def maybe_fold_turboquant_value_output_projections(
 
     weight_dtype = (
         qkv_proj.weight.dtype
-        if qkv_proj.weight.is_floating_point()
+        if qkv_proj is not None and qkv_proj.weight.is_floating_point()
         else act_dtype
     )
     rotation = make_turboquant_rotation(
         head_size,
         weight_dtype,
-        qkv_proj.weight.device,
+        qkv_proj.weight.device if qkv_proj is not None else v_proj_separate.weight.device,
         seed=impl._rotation_seed,
     )
 
     with torch.no_grad():
-        _fold_local_v_proj_weight_(
-            qkv_proj.weight,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            head_size=head_size,
-            rotation=rotation,
-        )
+        if qkv_proj is not None:
+            # Fused QKV: fold V from the V portion
+            _fold_local_v_proj_weight_(
+                qkv_proj.weight,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                rotation=rotation,
+            )
+        else:
+            # Separate V projection: fold V directly
+            _fold_separate_v_proj_weight_(
+                v_proj_separate.weight,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                rotation=rotation,
+            )
         _fold_local_o_proj_weight_(
             o_proj.weight,
             num_heads=num_heads,

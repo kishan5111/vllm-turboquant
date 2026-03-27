@@ -133,6 +133,14 @@ def process_weights_after_loading(
             for _, m in model.named_modules()
         )
         if _is_tq:
+            _debug_count = sum(
+                1
+                for _, m in model.named_modules()
+                if isinstance(getattr(getattr(m, "attn", None), "impl", None), TurboQuantAttentionImpl)
+                and getattr(m, "qkv_proj", None) is not None
+            )
+            logger.info("TurboQuant debug: %d TQ attention layers with qkv_proj", _debug_count)
+        if _is_tq:
             folded = sum(
                 maybe_fold_turboquant_value_output_projections(m, model_config.dtype)
                 for _, m in model.named_modules()
