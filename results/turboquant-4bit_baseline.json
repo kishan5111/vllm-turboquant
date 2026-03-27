@@ -1,0 +1,88 @@
+{
+  "config": {
+    "model": "Qwen/Qwen3-8B",
+    "kv_dtype": "turboquant_4bit",
+    "output": "results/turboquant-4bit_baseline.json",
+    "max_model_len": 12288,
+    "gpu_util": 0.8,
+    "workloads": [
+      "high_context",
+      "high_throughput",
+      "concurrency_16",
+      "concurrency_64",
+      "concurrency_128"
+    ]
+  },
+  "results": [
+    {
+      "workload": "high_context",
+      "backend": "turboquant_4bit",
+      "num_requests": 8,
+      "input_len": 8192,
+      "output_len": 64,
+      "total_time_s": 4.508,
+      "total_output_tokens": 512,
+      "output_tok_per_s": 113.6,
+      "request_per_s": 1.77,
+      "p99_latency_s": 0,
+      "peak_vram_gb": 0.0,
+      "effective_kv_bytes_per_token": 1056
+    },
+    {
+      "workload": "high_throughput",
+      "backend": "turboquant_4bit",
+      "num_requests": 32,
+      "input_len": 2048,
+      "output_len": 128,
+      "total_time_s": 18.43,
+      "total_output_tokens": 4096,
+      "output_tok_per_s": 222.2,
+      "request_per_s": 1.74,
+      "p99_latency_s": 0,
+      "peak_vram_gb": 0.0,
+      "effective_kv_bytes_per_token": 1056
+    },
+    {
+      "workload": "concurrency_16",
+      "backend": "turboquant_4bit",
+      "num_requests": 16,
+      "input_len": 1024,
+      "output_len": 64,
+      "total_time_s": 4.997,
+      "total_output_tokens": 1024,
+      "output_tok_per_s": 204.9,
+      "request_per_s": 3.2,
+      "p99_latency_s": 0,
+      "peak_vram_gb": 0.0,
+      "effective_kv_bytes_per_token": 1056
+    },
+    {
+      "workload": "concurrency_64",
+      "backend": "turboquant_4bit",
+      "num_requests": 64,
+      "input_len": 1024,
+      "output_len": 64,
+      "total_time_s": 20.314,
+      "total_output_tokens": 4096,
+      "output_tok_per_s": 201.6,
+      "request_per_s": 3.15,
+      "p99_latency_s": 0,
+      "peak_vram_gb": 0.0,
+      "effective_kv_bytes_per_token": 1056
+    },
+    {
+      "workload": "concurrency_128",
+      "backend": "turboquant_4bit",
+      "num_requests": 128,
+      "input_len": 1024,
+      "output_len": 64,
+      "total_time_s": 39.309,
+      "total_output_tokens": 8192,
+      "output_tok_per_s": 208.4,
+      "request_per_s": 3.26,
+      "p99_latency_s": 0,
+      "peak_vram_gb": 0.0,
+      "effective_kv_bytes_per_token": 1056
+    }
+  ]
+}
