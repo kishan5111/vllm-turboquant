@@ -270,8 +270,9 @@ class TurboQuantAttentionBackend(FlashAttentionBackend):
         vllm_config,
         kv_cache_spec,
     ) -> AttentionCGSupport:
-        # The metadata builder reports the decode-only graphable fast path.
-        return AttentionCGSupport.NEVER
+        # Decode-only (max_query_len=1) fused kernel is CUDA-graph-capturable.
+        # Mixed prefill/decode falls back to decompress+FlashAttention path.
+        return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
     @classmethod
     def supports_compute_capability(cls, capability) -> bool:

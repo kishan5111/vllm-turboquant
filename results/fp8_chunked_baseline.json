@@ -1,0 +1,77 @@
+{
+  "config": {
+    "model": "Qwen/Qwen3-8B",
+    "kv_dtype": "fp8",
+    "attention_backend": null,
+    "enforce_eager": false,
+    "no_chunked_prefill": false,
+    "output": "results/fp8_chunked_baseline.json",
+    "max_model_len": 8192,
+    "gpu_util": 0.8,
+    "workloads": [
+      "high_context",
+      "high_throughput",
+      "concurrency_16",
+      "concurrency_64",
+      "concurrency_128"
+    ]
+  },
+  "results": [
+    {
+      "workload": "high_throughput",
+      "backend": "fp8",
+      "num_requests": 32,
+      "input_len": 2048,
+      "output_len": 128,
+      "total_time_s": 2.636,
+      "total_output_tokens": 4096,
+      "output_tok_per_s": 1553.9,
+      "request_per_s": 12.14,
+      "p99_latency_s": 0,
+      "peak_vram_gb": 0.0,
+      "effective_kv_bytes_per_token": 2048
+    },
+    {
+      "workload": "concurrency_16",
+      "backend": "fp8",
+      "num_requests": 16,
+      "input_len": 1024,
+      "output_len": 64,
+      "total_time_s": 0.806,
+      "total_output_tokens": 1024,
+      "output_tok_per_s": 1270.5,
+      "request_per_s": 19.85,
+      "p99_latency_s": 0,
+      "peak_vram_gb": 0.0,
+      "effective_kv_bytes_per_token": 2048
+    },
+    {
+      "workload": "concurrency_64",
+      "backend": "fp8",
+      "num_requests": 64,
+      "input_len": 1024,
+      "output_len": 64,
+      "total_time_s": 2.075,
+      "total_output_tokens": 4096,
+      "output_tok_per_s": 1973.9,
+      "request_per_s": 30.84,
+      "p99_latency_s": 0,
+      "peak_vram_gb": 0.0,
+      "effective_kv_bytes_per_token": 2048
+    },
+    {
+      "workload": "concurrency_128",
+      "backend": "fp8",
+      "num_requests": 128,
+      "input_len": 1024,
+      "output_len": 64,
+      "total_time_s": 3.736,
+      "total_output_tokens": 8192,
+      "output_tok_per_s": 2192.9,
+      "request_per_s": 34.26,
+      "p99_latency_s": 0,
+      "peak_vram_gb": 0.0,
+      "effective_kv_bytes_per_token": 2048
+    }
+  ]
+}
