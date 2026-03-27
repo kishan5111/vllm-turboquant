@@ -117,6 +117,34 @@ def process_weights_after_loading(
             with device_loading_context(module, target_device):
                 module.process_weights_after_loading(model_config.dtype)
 
+    # TurboQuant: fold the per-layer rotation matrices into V/output projection
+    # weights so that no extra GEMM is needed per decode step.
+    # This is the Priority-1 optimization: eliminates K@R, V@R, out@R^T GEMMs.
+    try:
+        from vllm.v1.attention.backends.turboquant_attn import (
+            TurboQuantAttentionImpl,
+            maybe_fold_turboquant_value_output_projections,
+        )
+        _is_tq = any(
+            isinstance(
+                getattr(getattr(m, "attn", None), "impl", None),
+                TurboQuantAttentionImpl,
+            )
+            for _, m in model.named_modules()
+        )
+        if _is_tq:
+            folded = sum(
+                maybe_fold_turboquant_value_output_projections(m, model_config.dtype)
+                for _, m in model.named_modules()
+            )
+            logger.info(
+                "TurboQuant: folded V/output rotations into %d attention layer(s). "
+                "Per-decode-step V@R and out@R^T GEMMs eliminated.",
+                folded,
+            )
+    except ImportError:
+        pass
+
     # Needed for torchao model reloading via model.reload_weights
     # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`
     if model_config.quantization == "torchao":

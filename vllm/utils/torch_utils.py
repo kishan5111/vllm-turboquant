@@ -41,6 +41,9 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "int8": torch.int8,
     "fp8_inc": torch.float8_e4m3fn,
     "fp8_ds_mla": torch.uint8,
+    # TurboQuant: compressed uint8 KV cache (4-bit nibbles + 2-byte scale per head)
+    "turboquant_4bit": torch.uint8,
+    "turboquant_qjl": torch.uint8,
 }
 
 TORCH_DTYPE_TO_NUMPY_DTYPE = {

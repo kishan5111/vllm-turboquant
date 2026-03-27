@@ -55,6 +55,10 @@ def _get_backend_priorities(
     kv_cache_dtype: CacheDType | None = None,
 ) -> list[AttentionBackendEnum]:
     """Get backend priorities with lazy import to avoid circular dependency."""
+    # TurboQuant KV cache: always route to the dedicated backend regardless of MLA.
+    if kv_cache_dtype is not None and kv_cache_dtype.startswith("turboquant"):
+        return [AttentionBackendEnum.TURBOQUANT]
+
     if use_mla:
         if device_capability.major == 10:
             # Sparse MLA backend priorities

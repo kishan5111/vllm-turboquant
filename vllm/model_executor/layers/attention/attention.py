@@ -514,6 +514,22 @@ class Attention(nn.Module, AttentionLayerBase):
         block_size = vllm_config.cache_config.block_size
         # Should not be called for enc-dec or encoder-only attention.
         assert self.attn_type == AttentionType.DECODER
+
+        # For TurboQuant, the KV cache stores compressed uint8 data.
+        # The head_size in the spec must reflect the compressed byte count per
+        # head (D/2 + 2 = 66 for 4-bit with D=128) rather than the original
+        # head_size, so that the block allocator gives correctly-sized tensors.
+        kv_head_size = self.head_size
+        kv_head_size_v = self.head_size_v
+        if self.kv_cache_dtype.startswith("turboquant"):
+            from vllm.v1.attention.backends.turboquant_attn import (
+                turboquant_comp_head_size,
+            )
+            bits = int(self.kv_cache_dtype.split("_")[1].replace("bit", "")) \
+                if self.kv_cache_dtype != "turboquant_qjl" else 4
+            kv_head_size = turboquant_comp_head_size(self.head_size, bits)
+            kv_head_size_v = kv_head_size
+
         if self.sliding_window is not None:
             assert not vllm_config.model_config.use_mla, (
                 "MLA is not supported for slidingwindow"
@@ -521,7 +537,7 @@ class Attention(nn.Module, AttentionLayerBase):
             return SlidingWindowSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
-                head_size=self.head_size,
+                head_size=kv_head_size,
                 dtype=self.kv_cache_torch_dtype,
                 sliding_window=self.sliding_window,
             )
@@ -529,8 +545,8 @@ class Attention(nn.Module, AttentionLayerBase):
             return FullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
-                head_size=self.head_size,
-                head_size_v=self.head_size_v,
+                head_size=kv_head_size,
+                head_size_v=kv_head_size_v,
                 dtype=self.kv_cache_torch_dtype,
             )
 
