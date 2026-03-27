@@ -17,7 +17,10 @@ During the forward pass:
 Reference: Zandieh et al., arXiv 2504.19874 (ICLR 2026).
 """
 
+import atexit
+import json
 import os
+import time
 from dataclasses import replace
 from typing import ClassVar
 
@@ -72,6 +75,80 @@ if is_flash_attn_varlen_func_available():
         flash_attn_varlen_func,
         get_scheduler_metadata,
     )
+
+
+_PROFILE_PREFILL = os.environ.get("TURBOQUANT_PROFILE_PREFILL", "0") == "1"
+_PROFILE_PREFILL_FLUSH_EVERY = max(
+    1, int(os.environ.get("TURBOQUANT_PROFILE_PREFILL_FLUSH_EVERY", "1"))
+)
+_PREFILL_TIMINGS: dict[str, float] = {
+    "calls": 0.0,
+    "gather_unique_ms": 0.0,
+    "decompress_ms": 0.0,
+    "rotate_q_ms": 0.0,
+    "remap_ms": 0.0,
+    "stack_ms": 0.0,
+    "flash_attn_ms": 0.0,
+    "inverse_rotate_ms": 0.0,
+    "num_unique_blocks": 0.0,
+}
+
+
+def _time_cuda_section(fn):
+    if not _PROFILE_PREFILL:
+        return fn()
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    out = fn()
+    torch.cuda.synchronize()
+    return out, (time.perf_counter() - start) * 1e3
+
+
+def _record_prefill_timing(**kwargs: float) -> None:
+    if not _PROFILE_PREFILL:
+        return
+    for key, value in kwargs.items():
+        _PREFILL_TIMINGS[key] = _PREFILL_TIMINGS.get(key, 0.0) + value
+
+
+def _dump_prefill_timings() -> None:
+    if not _PROFILE_PREFILL or _PREFILL_TIMINGS["calls"] == 0:
+        return
+    calls = _PREFILL_TIMINGS["calls"]
+    summary = {
+        "calls": int(calls),
+        "avg_unique_blocks": _PREFILL_TIMINGS["num_unique_blocks"] / calls,
+    }
+    for key in (
+        "gather_unique_ms",
+        "decompress_ms",
+        "rotate_q_ms",
+        "remap_ms",
+        "stack_ms",
+        "flash_attn_ms",
+        "inverse_rotate_ms",
+    ):
+        summary[f"avg_{key}"] = _PREFILL_TIMINGS[key] / calls
+
+    out_path = os.environ.get(
+        "TURBOQUANT_PROFILE_PREFILL_PATH",
+        f"/tmp/turboquant_prefill_timing_{os.getpid()}.json",
+    )
+    with open(out_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"TurboQuant prefill timing summary written to {out_path}")
+
+
+def _maybe_flush_prefill_timings() -> None:
+    if not _PROFILE_PREFILL:
+        return
+    calls = int(_PREFILL_TIMINGS.get("calls", 0.0))
+    if calls <= 0 or calls % _PROFILE_PREFILL_FLUSH_EVERY != 0:
+        return
+    _dump_prefill_timings()
+
+
+atexit.register(_dump_prefill_timings)
 
 
 def _turboquant_bits(cache_dtype: str) -> int:
@@ -654,14 +731,42 @@ class TurboQuantAttentionImpl(FlashAttentionImpl):
         # comp_key_cache: [num_blocks, num_kv_heads, block_size, comp_head] UINT8
         # (coalesced layout: kv_head before position)
 
-        num_all_blocks = comp_key_cache.shape[0]
         block_size     = comp_key_cache.shape[2]  # dim 2 in new layout
 
         # ---- 1. Gather the unique block indices needed this step ----
-        block_table = attn_metadata.block_table  # [batch, max_blocks]
-        flat = block_table.reshape(-1)
-        valid = flat[flat >= 0]
-        unique_blk_ids = torch.unique(valid)          # [num_unique]
+        num_reqs = attn_metadata.query_start_loc.shape[0] - 1
+        block_table = attn_metadata.block_table[:num_reqs]  # [batch, max_blocks]
+        seq_lens = attn_metadata.seq_lens[:num_reqs]
+        if _PROFILE_PREFILL:
+            def _gather_unique() -> tuple[torch.Tensor, torch.Tensor]:
+                blocks_needed = torch.div(
+                    seq_lens + (block_size - 1),
+                    block_size,
+                    rounding_mode="floor",
+                )
+                block_positions = torch.arange(
+                    block_table.shape[1], device=block_table.device
+                )
+                used_mask = block_positions.unsqueeze(0) < blocks_needed.unsqueeze(1)
+                valid = block_table[used_mask]
+                valid = valid[valid >= 0]
+                return used_mask, torch.unique(valid)
+
+            (used_mask, unique_blk_ids), gather_ms = _time_cuda_section(_gather_unique)
+        else:
+            blocks_needed = torch.div(
+                seq_lens + (block_size - 1),
+                block_size,
+                rounding_mode="floor",
+            )
+            block_positions = torch.arange(
+                block_table.shape[1], device=block_table.device
+            )
+            used_mask = block_positions.unsqueeze(0) < blocks_needed.unsqueeze(1)
+            valid = block_table[used_mask]
+            valid = valid[valid >= 0]
+            unique_blk_ids = torch.unique(valid)
+            gather_ms = 0.0
         num_unique = unique_blk_ids.shape[0]
 
         # ---- 2. Decompress those blocks into a temporary BF16 buffer ----
@@ -671,28 +776,67 @@ class TurboQuantAttentionImpl(FlashAttentionImpl):
         )
         decomp_value = torch.empty_like(decomp_key)
 
-        turboquant_decompress_blocks(comp_key_cache, unique_blk_ids, decomp_key)
-        turboquant_decompress_blocks(comp_value_cache, unique_blk_ids, decomp_value)
+        if _PROFILE_PREFILL:
+            def _do_decompress() -> None:
+                turboquant_decompress_blocks(comp_key_cache, unique_blk_ids,
+                                             decomp_key)
+                turboquant_decompress_blocks(comp_value_cache, unique_blk_ids,
+                                             decomp_value)
+            _, decompress_ms = _time_cuda_section(_do_decompress)
+        else:
+            turboquant_decompress_blocks(comp_key_cache, unique_blk_ids, decomp_key)
+            turboquant_decompress_blocks(comp_value_cache, unique_blk_ids, decomp_value)
+            decompress_ms = 0.0
 
         # Keep decompressed K/V in rotated space and rotate the current query
         # chunk once. For long-context prefill this is much cheaper than
         # derotating every referenced KV block back to the original basis.
+        num_actual = attn_metadata.num_actual_tokens
         R = self._get_rotation(query.dtype, query.device)
-        query_rot = apply_rotation(query, R)
+        if _PROFILE_PREFILL:
+            query_rot, rotate_q_ms = _time_cuda_section(
+                lambda: apply_rotation(query[:num_actual], R)
+            )
+        else:
+            query_rot = apply_rotation(query[:num_actual], R)
+            rotate_q_ms = 0.0
 
         # ---- 3. Remap block_table to indices in [0, num_unique) ----
-        if num_unique > 0:
-            max_blk = int(unique_blk_ids.max().item())
+        if _PROFILE_PREFILL:
+            def _remap_blocks() -> torch.Tensor:
+                remapped_bt = torch.full_like(block_table, -1)
+                if num_unique > 0:
+                    max_blk = int(unique_blk_ids.max().item())
+                    remap = torch.full(
+                        (max_blk + 2,),
+                        -1,
+                        dtype=block_table.dtype,
+                        device=block_table.device,
+                    )
+                    remap[unique_blk_ids] = torch.arange(
+                        num_unique, dtype=block_table.dtype, device=block_table.device
+                    )
+                    remapped_src = remap[block_table.clamp(min=0)]
+                    remapped_bt[used_mask] = remapped_src[used_mask]
+                return remapped_bt
+
+            remapped_bt, remap_ms = _time_cuda_section(_remap_blocks)
         else:
-            max_blk = 0
-        remap = torch.full(
-            (max_blk + 2,), -1, dtype=block_table.dtype, device=block_table.device
-        )
-        remap[unique_blk_ids] = torch.arange(
-            num_unique, dtype=block_table.dtype, device=block_table.device
-        )
-        remapped_bt = remap[block_table.clamp(min=0)]
-        remapped_bt[block_table < 0] = -1
+            remapped_bt = torch.full_like(block_table, -1)
+            if num_unique > 0:
+                max_blk = int(unique_blk_ids.max().item())
+                remap = torch.full(
+                    (max_blk + 2,),
+                    -1,
+                    dtype=block_table.dtype,
+                    device=block_table.device,
+                )
+                remap[unique_blk_ids] = torch.arange(
+                    num_unique, dtype=block_table.dtype, device=block_table.device
+                )
+                remapped_src = remap[block_table.clamp(min=0)]
+                remapped_bt[used_mask] = remapped_src[used_mask]
+            remap_ms = 0.0
 
         # ---- 4. Run standard FlashAttention on the decompressed buffers ----
         new_metadata = replace(attn_metadata, block_table=remapped_bt)
@@ -704,24 +848,63 @@ class TurboQuantAttentionImpl(FlashAttentionImpl):
 
         # Fake a kv_cache from the decompressed tensors so that super().forward
         # can unbind(0) it correctly.
-        fake_kv_cache = torch.stack([decomp_key, decomp_value], dim=0)
-
-        result = super().forward(
-            layer=layer,
-            query=query_rot,
-            key=key,
-            value=value,
-            kv_cache=fake_kv_cache,
-            attn_metadata=new_metadata,
-            output=output,
-            output_scale=output_scale,
-            output_block_scale=output_block_scale,
-        )
+        if _PROFILE_PREFILL:
+            fake_kv_cache, stack_ms = _time_cuda_section(
+                lambda: torch.stack([decomp_key, decomp_value], dim=0)
+            )
+            result, flash_attn_ms = _time_cuda_section(
+                lambda: super(TurboQuantAttentionImpl, self).forward(
+                    layer=layer,
+                    query=query_rot,
+                    key=key,
+                    value=value,
+                    kv_cache=fake_kv_cache,
+                    attn_metadata=new_metadata,
+                    output=output,
+                    output_scale=output_scale,
+                    output_block_scale=output_block_scale,
+                )
+            )
+        else:
+            fake_kv_cache = torch.stack([decomp_key, decomp_value], dim=0)
+            stack_ms = 0.0
+            result = super().forward(
+                layer=layer,
+                query=query_rot,
+                key=key,
+                value=value,
+                kv_cache=fake_kv_cache,
+                attn_metadata=new_metadata,
+                output=output,
+                output_scale=output_scale,
+                output_block_scale=output_block_scale,
+            )
+            flash_attn_ms = 0.0
 
         self.kv_cache_dtype = orig_dtype
         if not self._value_output_folded:
-            num_actual = attn_metadata.num_actual_tokens
-            result[:num_actual].copy_(apply_rotation(result[:num_actual], R.T))
+            if _PROFILE_PREFILL:
+                rotated_out, inverse_rotate_ms = _time_cuda_section(
+                    lambda: apply_rotation(result[:num_actual], R.T)
+                )
+                result[:num_actual].copy_(rotated_out)
+            else:
+                result[:num_actual].copy_(apply_rotation(result[:num_actual], R.T))
+                inverse_rotate_ms = 0.0
+        else:
+            inverse_rotate_ms = 0.0
+        _record_prefill_timing(
+            calls=1.0,
+            gather_unique_ms=gather_ms,
+            decompress_ms=decompress_ms,
+            rotate_q_ms=rotate_q_ms,
+            remap_ms=remap_ms,
+            stack_ms=stack_ms,
+            flash_attn_ms=flash_attn_ms,
+            inverse_rotate_ms=inverse_rotate_ms,
+            num_unique_blocks=float(num_unique),
+        )
+        _maybe_flush_prefill_timings()
         return result
 
     def _qjl_metadata_has_prefix(self, attn_metadata: FlashAttentionMetadata) -> bool:

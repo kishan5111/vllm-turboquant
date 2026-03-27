@@ -772,3 +772,68 @@ Why:
    - FlashAttention time on decompressed KV
 2. Optimize the mixed prefill/decode path rather than the pure decode kernel first.
 3. Re-run `ctx32k` and `ctx65k` after that path moves before starting the concurrency sweep.
+
+### 2026-03-27 Mixed-prefill instrumentation follow-up
+
+1. **Profiler flush fix**
+   - `turboquant_attn.py` now flushes prefill timing summaries from inside the forward path when `TURBOQUANT_PROFILE_PREFILL=1`.
+   - This fixed the earlier issue where worker shutdown could lose the JSON timing file entirely.
+
+2. **Direct-FA experiment**
+   - Output: `results/gpt-oss-20b_turboquant_ctx32k_direct_fa.json`
+   - Change: bypassed `super().forward(...)` and called `flash_attn_varlen_func(...)` directly on decompressed K/V to avoid the temporary fake-KV stack.
+   - Result: `ctx32k = 62.4 tok/s`, `ttft=2.256s`, `decode=41.1 tok/s`
+   - Conclusion: worse than the current baseline, so we did not keep this path.
+
+3. **Used-block masking experiment**
+   - Output: `results/gpt-oss-20b_turboquant_ctx32k_usedmask.json`
+   - Change: only considered actually-used logical block positions per request, and only rotated `query[:num_actual_tokens]`.
+   - Result: `ctx32k = 63.1 tok/s`, `ttft=2.260s`, `decode=40.6 tok/s`
+   - Conclusion: not a meaningful end-to-end improvement by itself, but the token-slicing cleanup remains in the backend.
+
+4. **No-prefix-cache unique-skipping experiment**
+   - Outputs:
+     - `results/gpt-oss-20b_turboquant_ctx32k_eager_nounique.json`
+     - `results/gpt-oss-20b_turboquant_ctx32k_nounique_piecewise.json`
+   - Hypothesis: `torch.unique` over the used block IDs was dominating mixed-prefill overhead.
+   - Eager result looked slightly better (`35.3 tok/s`, `ttft=2.378s`), but the real non-eager serving path regressed to `63.3 tok/s`.
+   - Conclusion: we reverted this optimization attempt. It was not a safe win.
+
+5. **Synchronized mixed-prefill timing breakdown**
+   - Output: `results/prefill_timing_ctx32k_sync.json`
+   - Command family:
+     ```bash
+     TURBOQUANT_PROFILE_PREFILL=1 \
+     TURBOQUANT_PROFILE_PREFILL_PATH=results/prefill_timing_ctx32k_sync.json \
+     TURBOQUANT_PROFILE_PREFILL_FLUSH_EVERY=16 \
+     .venv/bin/python scripts/run_bench.py \
+       --model openai/gpt-oss-20b \
+       --kv-dtype turboquant_4bit \
+       --workloads ctx32k \
+       --max-model-len 69632 \
+       --gpu-util 0.93 \
+       --enforce-eager
+     ```
+   - Measured average per mixed-prefill call:
+     - `flash_attn_ms`: `3.60 ms`
+     - `decompress_ms`: `0.80 ms`
+     - `gather_unique_ms`: `0.54 ms`
+     - `remap_ms`: `0.37 ms`
+     - `rotate_q_ms`: `0.30 ms`
+     - `stack_ms`: `0.13 ms`
+     - `avg_unique_blocks`: `4510.1`
+
+### Updated conclusion
+
+- The earlier unsynchronized timer overstated the cost of the unique/gather section.
+- With synchronized timings, the biggest mixed-prefill backend cost is the **fallback FlashAttention call on decompressed KV**, not `torch.unique`.
+- Decompression is the next largest backend-side component.
+- That means the next meaningful optimization is **not** another block-table micro-tweak; it is reducing or replacing the decompress-plus-FA path itself.
+
+### Updated next phase
+
+1. Focus on the long-context mixed-prefill backend in `vllm/v1/attention/backends/turboquant_attn.py`, specifically the decompress-plus-FlashAttention path.
+2. Evaluate whether we can:
+   - avoid full BF16 materialization of all referenced KV blocks, or
+   - route chunked long-context attention through a more direct compressed-KV attention kernel instead of FA-on-decompressed-KV.
+3. Re-run `ctx32k` and `ctx65k` after that change before doing the concurrency sweep.

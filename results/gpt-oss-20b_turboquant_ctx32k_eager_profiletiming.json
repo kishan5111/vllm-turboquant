@@ -1,0 +1,40 @@
+{
+  "config": {
+    "model": "openai/gpt-oss-20b",
+    "kv_dtype": "turboquant_4bit",
+    "attention_backend": null,
+    "enforce_eager": true,
+    "no_chunked_prefill": false,
+    "output": "results/gpt-oss-20b_turboquant_ctx32k_eager_profiletiming.json",
+    "max_model_len": 69632,
+    "gpu_util": 0.93,
+    "workloads": [
+      "ctx32k"
+    ],
+    "profile_turboquant_paths": false,
+    "cudagraph_mode": "auto"
+  },
+  "resolved_cudagraph_mode": "piecewise",
+  "results": [
+    {
+      "workload": "ctx32k",
+      "backend": "turboquant_4bit",
+      "num_requests": 4,
+      "input_len": 32768,
+      "output_len": 64,
+      "total_time_s": 7.78,
+      "total_output_tokens": 256,
+      "output_tok_per_s": 32.9,
+      "request_per_s": 0.51,
+      "p99_latency_s": 0,
+      "mean_ttft_s": 2.478,
+      "mean_prefill_s": 1.306,
+      "mean_decode_s": 4.828,
+      "mean_tpot_ms": 76.642,
+      "post_first_token_tok_per_s": 13.0,
+      "peak_vram_gb": 0.0,
+      "effective_kv_bytes_per_token": 1056
+    }
+  ],
+  "profile": []
+}

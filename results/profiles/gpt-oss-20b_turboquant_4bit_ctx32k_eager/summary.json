@@ -1,87 +1,87 @@
 {
-  "total_self_cuda_us": 7261960.05,
+  "total_self_cuda_us": 7273337.868,
   "categories": [
     {
       "category": "moe_ffn_routing",
-      "self_cuda_us": 2880719.232,
-      "share_pct": 39.67
+      "self_cuda_us": 2876952.747,
+      "share_pct": 39.55
     },
     {
       "category": "attention_kv",
-      "self_cuda_us": 2622577.0,
-      "share_pct": 36.11
+      "self_cuda_us": 2617761.0,
+      "share_pct": 35.99
     },
     {
       "category": "other",
-      "self_cuda_us": 1316701.976,
-      "share_pct": 18.13
+      "self_cuda_us": 1337185.875,
+      "share_pct": 18.38
     },
     {
       "category": "other_gemm",
-      "self_cuda_us": 311005.0,
-      "share_pct": 4.28
+      "self_cuda_us": 310558.0,
+      "share_pct": 4.27
     },
     {
       "category": "embedding_logits",
-      "self_cuda_us": 72310.0,
-      "share_pct": 1.0
+      "self_cuda_us": 72220.0,
+      "share_pct": 0.99
     },
     {
       "category": "norm",
-      "self_cuda_us": 58646.842,
+      "self_cuda_us": 58660.246,
       "share_pct": 0.81
     }
   ],
   "top_ops": [
     {
       "name": "vllm::moe_forward",
-      "self_cuda_us": 1379000.0,
-      "share_pct": 18.99
+      "self_cuda_us": 1377000.0,
+      "share_pct": 18.93
     },
     {
       "name": "_vllm_fa3_C::fwd",
-      "self_cuda_us": 830466.0,
-      "share_pct": 11.44
+      "self_cuda_us": 827861.0,
+      "share_pct": 11.38
     },
     {
       "name": "void cutlass::device_kernel<flash::enable_sm90_or_la...",
-      "self_cuda_us": 799397.0,
-      "share_pct": 11.01
+      "self_cuda_us": 796817.0,
+      "share_pct": 10.96
     },
     {
       "name": "vllm::unified_attention_with_output",
-      "self_cuda_us": 758733.0,
-      "share_pct": 10.45
+      "self_cuda_us": 758227.0,
+      "share_pct": 10.42
     },
     {
       "name": "_matmul_ogs_NNT_bf16xbf16xmxfp4_128x256x128x1_swiglu...",
-      "self_cuda_us": 708735.0,
-      "share_pct": 9.76
+      "self_cuda_us": 708062.0,
+      "share_pct": 9.74
     },
     {
       "name": "_tq_split_kv_kernel",
-      "self_cuda_us": 586038.0,
+      "self_cuda_us": 586791.0,
       "share_pct": 8.07
     },
     {
       "name": "_matmul_ogs_NNT_bf16xbf16xmxfp4_128x256x128x1",
-      "self_cuda_us": 374869.0,
-      "share_pct": 5.16
+      "self_cuda_us": 374336.0,
+      "share_pct": 5.15
     },
     {
       "name": "aten::addmm",
-      "self_cuda_us": 264978.0,
-      "share_pct": 3.65
+      "self_cuda_us": 264519.0,
+      "share_pct": 3.64
     },
     {
       "name": "nvjet_tst_192x192_64x4_1x2_h_bz_coopB_bias_TNN",
-      "self_cuda_us": 214359.0,
-      "share_pct": 2.95
+      "self_cuda_us": 213886.0,
+      "share_pct": 2.94
     },
     {
       "name": "_reduce",
-      "self_cuda_us": 184916.0,
-      "share_pct": 2.55
+      "self_cuda_us": 184176.0,
+      "share_pct": 2.53
     },
     {
       "name": "_turboquant_unpack_kernel",
@@ -90,47 +90,47 @@
     },
     {
       "name": "vllm::unified_kv_cache_update",
-      "self_cuda_us": 137323.0,
-      "share_pct": 1.89
+      "self_cuda_us": 136723.0,
+      "share_pct": 1.88
     },
     {
       "name": "_turboquant_pack_kernel",
-      "self_cuda_us": 137323.0,
-      "share_pct": 1.89
+      "self_cuda_us": 136723.0,
+      "share_pct": 1.88
     },
     {
       "name": "_matmul_ogs_NNT_bf16xbf16xmxfp4_16x256x128x1_swiglu",
-      "self_cuda_us": 58465.0,
-      "share_pct": 0.81
+      "self_cuda_us": 58311.0,
+      "share_pct": 0.8
     },
     {
       "name": "_C::fused_add_rms_norm",
-      "self_cuda_us": 57182.0,
+      "self_cuda_us": 57202.0,
       "share_pct": 0.79
     },
     {
       "name": "std::enable_if<(((8)>(0)))&&vllm::_typeConvert<c10::...",
-      "self_cuda_us": 57182.0,
+      "self_cuda_us": 57202.0,
       "share_pct": 0.79
     },
     {
       "name": "aten::copy_",
-      "self_cuda_us": 50918.0,
+      "self_cuda_us": 50906.0,
       "share_pct": 0.7
     },
     {
       "name": "aten::mm",
-      "self_cuda_us": 46027.0,
+      "self_cuda_us": 46039.0,
       "share_pct": 0.63
     },
     {
       "name": "void at::native::elementwise_kernel<128, 4, at::nati...",
-      "self_cuda_us": 41309.0,
+      "self_cuda_us": 41210.0,
       "share_pct": 0.57
     },
     {
       "name": "_C::rotary_embedding",
-      "self_cuda_us": 36155.0,
+      "self_cuda_us": 36110.0,
       "share_pct": 0.5
     }
   ],

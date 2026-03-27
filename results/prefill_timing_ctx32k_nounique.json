@@ -1,0 +1,11 @@
+{
+  "calls": 240,
+  "avg_unique_blocks": 4510.1,
+  "avg_gather_unique_ms": 5.626857901612918,
+  "avg_decompress_ms": 0.7965482771396637,
+  "avg_rotate_q_ms": 0.29827288041512173,
+  "avg_remap_ms": 0.1275552436709404,
+  "avg_stack_ms": 0.13285884633660316,
+  "avg_flash_attn_ms": 3.6094028813143573,
+  "avg_inverse_rotate_ms": 0.0
+}
