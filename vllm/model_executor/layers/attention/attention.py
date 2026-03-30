@@ -524,10 +524,13 @@ class Attention(nn.Module, AttentionLayerBase):
         if self.kv_cache_dtype.startswith("turboquant"):
             from vllm.v1.attention.backends.turboquant_attn import (
                 turboquant_comp_head_size,
+                turboquant_qjl_slot_size,
             )
-            bits = int(self.kv_cache_dtype.split("_")[1].replace("bit", "")) \
-                if self.kv_cache_dtype != "turboquant_qjl" else 4
-            kv_head_size = turboquant_comp_head_size(self.head_size, bits)
+            if self.kv_cache_dtype == "turboquant_qjl":
+                kv_head_size = turboquant_qjl_slot_size(self.head_size)
+            else:
+                bits = int(self.kv_cache_dtype.split("_")[1].replace("bit", ""))
+                kv_head_size = turboquant_comp_head_size(self.head_size, bits)
             kv_head_size_v = kv_head_size
 
         if self.sliding_window is not None:

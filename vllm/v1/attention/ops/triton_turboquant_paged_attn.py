@@ -261,8 +261,8 @@ def _tq_split_kv_kernel(
         # the previous compile-time-unrolled per-head masked loop, which is
         # especially costly for GPT-OSS where GQA_RATIO=8.
         scores = (
-            tl.dot(q_lo_grp.to(k_lo.dtype), tl.trans(k_lo), input_precision="ieee")
-            + tl.dot(q_hi_grp.to(k_hi.dtype), tl.trans(k_hi), input_precision="ieee")
+            tl.dot(q_lo_grp.to(k_lo.dtype), tl.trans(k_lo))
+            + tl.dot(q_hi_grp.to(k_hi.dtype), tl.trans(k_hi))
         ).to(tl.float32) * attn_scale                            # [GQA_RATIO, BLOCK_SIZE]
         scores = tl.where(valid[None, :], scores, -1e38)
 
@@ -272,10 +272,10 @@ def _tq_split_kv_kernel(
         exp_sc    = tl.exp(scores - m_new[:, None])              # [GQA_RATIO, BLOCK_SIZE]
         exp_sc    = tl.where(valid[None, :], exp_sc, 0.0)
 
-        delta_lo = tl.dot(exp_sc.to(v_lo.dtype), v_lo, input_precision="ieee").to(
+        delta_lo = tl.dot(exp_sc.to(v_lo.dtype), v_lo).to(
             tl.float32
         )                                                        # [GQA_RATIO, HALF]
-        delta_hi = tl.dot(exp_sc.to(v_hi.dtype), v_hi, input_precision="ieee").to(
+        delta_hi = tl.dot(exp_sc.to(v_hi.dtype), v_hi).to(
             tl.float32
         )                                                        # [GQA_RATIO, HALF]
 

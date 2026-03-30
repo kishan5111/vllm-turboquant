@@ -51,15 +51,15 @@ from vllm.v1.attention.ops.triton_turboquant_kv import (
     turboquant_compress_kv,
     turboquant_decompress_blocks,
 )
-# QJL ops are an optional prototype that requires an external kernel build.
-# Import lazily so that turboquant_4bit works without the QJL package.
+# QJL ops are an optional in-repo prototype. Import lazily so that
+# turboquant_4bit works even if the experimental path is broken.
 try:
-    from vllm.v1.attention.ops.qjl_decode_proto import (
+    from vllm.v1.attention.ops.qjl_backend_proto import (
         cuda_quantized_bmm_gqa_dynamic,
         decode_packed_qjl,
         make_qjl_projection,
-        pack_full_blocks_to_packed_qjl_cache,
-        packed_qjl_prefix_scores,
+        pack_tokens_to_packed_qjl_cache,
+        packed_qjl_prefix_scores_multi_query,
         qjl_packed_slot_size,
     )
     _QJL_AVAILABLE = True
@@ -165,8 +165,12 @@ def turboquant_qjl_slot_size(head_size: int) -> int:
     if not _QJL_AVAILABLE:
         raise RuntimeError("QJL kernel not available. Build /workspace/QJL/qjl_kernel.")
     return qjl_packed_slot_size(  # type: ignore[name-defined]
-        sketch_dim=256,
-        outlier_count=8,
+        # TurboQuant stage 1 + 2:
+        #   - 2-bit rotated key quantizer
+        #   - 1-bit residual sketch with one bit per channel
+        # The in-repo path no longer reserves dead outlier-index bytes.
+        sketch_dim=head_size,
+        outlier_count=0,
         head_size=head_size,
         value_group_size=32,
         value_bits=2,
@@ -370,7 +374,10 @@ class TurboQuantAttentionBackend(FlashAttentionBackend):
         if cache_dtype_str == "turboquant_qjl":
             if block_size % 32 != 0:
                 raise ValueError("TurboQuant QJL requires block size 32-aligned.")
-            return (1, num_blocks, num_kv_heads, block_size, head_size)
+            # vLLM still allocates two cache planes for decoder attention.
+            # The QJL path only uses kv_cache[0], but we keep the leading
+            # dimension at 2 so the raw allocation matches the expected view.
+            return (2, num_blocks, num_kv_heads, block_size, head_size)
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
         # head_size here is already the compressed byte count per head
@@ -504,7 +511,8 @@ class TurboQuantAttentionImpl(FlashAttentionImpl):
         self._value_output_folded = False
         self._qjl_proj_score: torch.Tensor | None = None
         self._qjl_proj_quant: torch.Tensor | None = None
-        self._qjl_outlier_count = 8
+        self._qjl_sketch_dim = head_size
+        self._qjl_outlier_count = 0
         self._qjl_value_bits = 2
         self._qjl_value_group_size = 32
         self._qjl_exact_key_blocks: dict[int, torch.Tensor] = {}
@@ -538,7 +546,7 @@ class TurboQuantAttentionImpl(FlashAttentionImpl):
         ):
             self._qjl_proj_score, self._qjl_proj_quant = make_qjl_projection(
                 self._real_head_size,
-                256,
+                self._qjl_sketch_dim,
                 dtype=torch.float32,
                 device=device,
                 seed=self._rotation_seed,
@@ -586,93 +594,24 @@ class TurboQuantAttentionImpl(FlashAttentionImpl):
         slot_mapping: torch.Tensor,
     ) -> None:
         packed_cache = kv_cache[0]
-        block_size = packed_cache.shape[2]
-
-        valid_mask = slot_mapping >= 0
-        if not torch.any(valid_mask):
-            return
-
-        key = key[valid_mask]
-        value = value[valid_mask]
-        slot_mapping = slot_mapping[valid_mask].to(torch.long)
-
-        block_ids = torch.div(slot_mapping, block_size, rounding_mode="floor")
-        block_pos = slot_mapping.remainder(block_size)
-        order = torch.argsort(block_ids * block_size + block_pos)
-        key = key[order]
-        value = value[order]
-        block_ids = block_ids[order]
-        block_pos = block_pos[order]
-
-        uniq_blocks, counts = torch.unique_consecutive(block_ids, return_counts=True)
-        expected_pos = torch.arange(block_size, device=key.device, dtype=block_pos.dtype)
-        full_block_ids: list[int] = []
-        full_key_blocks: list[torch.Tensor] = []
-        full_value_blocks: list[torch.Tensor] = []
-
-        start = 0
-        for block_id_t, count_t in zip(uniq_blocks, counts):
-            block_id = int(block_id_t.item())
-            count = int(count_t.item())
-            end = start + count
-            pos = block_pos[start:end]
-            key_group = key[start:end]
-            value_group = value[start:end]
-            start = end
-
-            is_full_group = (
-                count == block_size
-                and torch.equal(pos, expected_pos)
-                and block_id not in self._qjl_exact_key_blocks
-            )
-            if is_full_group:
-                full_block_ids.append(block_id)
-                full_key_blocks.append(key_group.permute(1, 0, 2).contiguous())
-                full_value_blocks.append(value_group.permute(1, 0, 2).contiguous())
-                continue
-
-            if block_id not in self._qjl_exact_key_blocks or int(pos[0].item()) == 0:
-                self._qjl_exact_key_blocks[block_id] = torch.empty(
-                    self.num_kv_heads,
-                    block_size,
-                    self._real_head_size,
-                    device=key.device,
-                    dtype=key.dtype,
-                )
-                self._qjl_exact_value_blocks[block_id] = torch.empty(
-                    self.num_kv_heads,
-                    block_size,
-                    self._real_head_size,
-                    device=value.device,
-                    dtype=value.dtype,
-                )
-                self._qjl_exact_lengths[block_id] = 0
-
-            self._qjl_exact_key_blocks[block_id][:, pos] = key_group.permute(1, 0, 2)
-            self._qjl_exact_value_blocks[block_id][:, pos] = value_group.permute(1, 0, 2)
-            new_len = max(
-                self._qjl_exact_lengths[block_id],
-                int(pos.max().item()) + 1,
-            )
-            self._qjl_exact_lengths[block_id] = new_len
-            if new_len == block_size:
-                full_block_ids.append(block_id)
-                full_key_blocks.append(self._qjl_exact_key_blocks.pop(block_id))
-                full_value_blocks.append(self._qjl_exact_value_blocks.pop(block_id))
-                self._qjl_exact_lengths.pop(block_id, None)
-
-        if full_block_ids:
-            _, proj_dir_quant = self._get_qjl_projection(key.device)
-            pack_full_blocks_to_packed_qjl_cache(
-                torch.stack(full_key_blocks, dim=0),
-                torch.stack(full_value_blocks, dim=0),
-                packed_cache,
-                torch.tensor(full_block_ids, device=key.device, dtype=torch.long),
-                proj_dir_quant=proj_dir_quant,
-                value_group_size=self._qjl_value_group_size,
-                value_bits=self._qjl_value_bits,
-                outlier_count=self._qjl_outlier_count,
-            )
+        _, proj_dir_quant = self._get_qjl_projection(key.device)
+        rotation = self._get_rotation(key.dtype, key.device)
+        assume_valid = (
+            key.is_cuda
+            and torch.cuda.is_current_stream_capturing()
+        )
+        pack_tokens_to_packed_qjl_cache(
+            key,
+            value,
+            packed_cache,
+            slot_mapping,
+            proj_dir_quant=proj_dir_quant,
+            rotation=rotation,
+            value_group_size=self._qjl_value_group_size,
+            value_bits=self._qjl_value_bits,
+            outlier_count=self._qjl_outlier_count,
+            assume_valid=assume_valid,
+        )
 
     # ------------------------------------------------------------------
     # Read path — decompress used blocks then run flash_attn
@@ -706,11 +645,16 @@ class TurboQuantAttentionImpl(FlashAttentionImpl):
             )
 
         if self._use_qjl:
-            if attn_metadata.max_query_len == 1 and not attn_metadata.use_cascade:
+            if attn_metadata.max_query_len == 1:
                 return self._forward_qjl_decode(query, kv_cache, attn_metadata, output)
             if self._qjl_metadata_has_prefix(attn_metadata):
-                raise NotImplementedError(
-                    "TurboQuant QJL currently requires non-chunked prefill."
+                return self._forward_qjl_prefix_prefill(
+                    query=query[: attn_metadata.num_actual_tokens],
+                    key=key[: attn_metadata.num_actual_tokens],
+                    value=value[: attn_metadata.num_actual_tokens],
+                    kv_cache=kv_cache,
+                    attn_metadata=attn_metadata,
+                    output=output[: attn_metadata.num_actual_tokens],
                 )
             return self._forward_qjl_prefill(
                 layer=layer,
@@ -953,152 +897,25 @@ class TurboQuantAttentionImpl(FlashAttentionImpl):
     ) -> torch.Tensor:
         packed_cache = kv_cache[0]
         proj_dir_score, _ = self._get_qjl_projection(query.device)
+        rotation = self._get_rotation(query.dtype, query.device)
 
         num_actual = attn_metadata.num_actual_tokens
         query = query[:num_actual]
         seq_lens = attn_metadata.seq_lens[:num_actual]
         block_table = attn_metadata.block_table[:num_actual]
 
-        if not self._qjl_exact_key_blocks:
-            result = decode_packed_qjl(
-                query,
-                packed_cache=packed_cache,
-                block_table=block_table,
-                seq_lens=seq_lens,
-                proj_dir_score=proj_dir_score,
-                scale=self.scale,
-                outlier_count=self._qjl_outlier_count,
-                value_group_size=self._qjl_value_group_size,
-                value_bits=self._qjl_value_bits,
-            )
-            output[:num_actual].copy_(result)
-            return output
-
-        batch = num_actual
-        q_per_kv = self.num_heads // self.num_kv_heads
-        exact_block_ids = set(self._qjl_exact_key_blocks)
-
-        comp_rows: list[list[int]] = []
-        exact_key_rows: list[torch.Tensor] = []
-        exact_value_rows: list[torch.Tensor] = []
-        exact_lens: list[int] = []
-        max_comp_blocks = 0
-        max_exact_tokens = 0
-
-        for row in block_table:
-            comp_ids: list[int] = []
-            exact_k_chunks: list[torch.Tensor] = []
-            exact_v_chunks: list[torch.Tensor] = []
-            for block_id in row[row >= 0].tolist():
-                if block_id in exact_block_ids:
-                    exact_len = self._qjl_exact_lengths[block_id]
-                    exact_k_chunks.append(
-                        self._qjl_exact_key_blocks[block_id][:, :exact_len]
-                    )
-                    exact_v_chunks.append(
-                        self._qjl_exact_value_blocks[block_id][:, :exact_len]
-                    )
-                else:
-                    comp_ids.append(block_id)
-            comp_rows.append(comp_ids)
-            max_comp_blocks = max(max_comp_blocks, len(comp_ids))
-            if exact_k_chunks:
-                exact_key = torch.cat(exact_k_chunks, dim=1)
-                exact_value = torch.cat(exact_v_chunks, dim=1)
-            else:
-                exact_key = query.new_empty(
-                    self.num_kv_heads, 0, self._real_head_size
-                )
-                exact_value = query.new_empty(
-                    self.num_kv_heads, 0, self._real_head_size
-                )
-            exact_key_rows.append(exact_key)
-            exact_value_rows.append(exact_value)
-            exact_lens.append(exact_key.shape[1])
-            max_exact_tokens = max(max_exact_tokens, exact_key.shape[1])
-
-        prefix_lens = seq_lens - torch.tensor(
-            exact_lens, device=query.device, dtype=seq_lens.dtype
+        result = decode_packed_qjl(
+            query,
+            packed_cache=packed_cache,
+            block_table=block_table,
+            seq_lens=seq_lens,
+            proj_dir_score=proj_dir_score,
+            scale=self.scale,
+            rotation=rotation,
+            outlier_count=self._qjl_outlier_count,
+            value_group_size=self._qjl_value_group_size,
+            value_bits=self._qjl_value_bits,
         )
-        if max_comp_blocks > 0:
-            comp_block_table = torch.zeros(
-                batch, max_comp_blocks, device=query.device, dtype=block_table.dtype
-            )
-            for i, comp_ids in enumerate(comp_rows):
-                if comp_ids:
-                    comp_block_table[i, : len(comp_ids)] = torch.tensor(
-                        comp_ids, device=query.device, dtype=block_table.dtype
-                    )
-            prefix_scores, value_pack, value_scale, value_min = packed_qjl_prefix_scores(
-                query,
-                packed_cache=packed_cache,
-                block_table=comp_block_table,
-                seq_lens=prefix_lens,
-                proj_dir_score=proj_dir_score,
-                scale=self.scale,
-                outlier_count=self._qjl_outlier_count,
-                value_group_size=self._qjl_value_group_size,
-                value_bits=self._qjl_value_bits,
-            )
-        else:
-            prefix_scores = query.new_empty((batch, self.num_heads, 0), dtype=torch.float32)
-            value_pack = query.new_empty(
-                (batch, self.num_kv_heads, 0, self._real_head_size * self._qjl_value_bits // 32),
-                dtype=torch.int32,
-            )
-            value_scale = query.new_empty(
-                (batch, self.num_kv_heads, 0, self._real_head_size // self._qjl_value_group_size)
-            )
-            value_min = torch.empty_like(value_scale)
-
-        if max_exact_tokens > 0:
-            exact_key = query.new_zeros(
-                (batch, self.num_kv_heads, max_exact_tokens, self._real_head_size)
-            )
-            exact_value = torch.zeros_like(exact_key)
-            for i, (k_row, v_row) in enumerate(zip(exact_key_rows, exact_value_rows)):
-                if k_row.shape[1] > 0:
-                    exact_key[i, :, : k_row.shape[1]] = k_row
-                    exact_value[i, :, : v_row.shape[1]] = v_row
-            exact_key = exact_key.repeat_interleave(q_per_kv, dim=1)
-            exact_value = exact_value.repeat_interleave(q_per_kv, dim=1)
-            exact_scores = torch.einsum("bhd,bhkd->bhk", query, exact_key) * self.scale
-            exact_idx = torch.arange(
-                max_exact_tokens, device=query.device, dtype=seq_lens.dtype
-            )
-            exact_valid = exact_idx.unsqueeze(0) < torch.tensor(
-                exact_lens, device=query.device, dtype=seq_lens.dtype
-            ).unsqueeze(1)
-            exact_scores = exact_scores.masked_fill(
-                ~exact_valid.unsqueeze(1), float("-inf")
-            )
-        else:
-            exact_scores = query.new_empty((batch, self.num_heads, 0), dtype=torch.float32)
-            exact_value = query.new_empty(
-                (batch, self.num_heads, 0, self._real_head_size)
-            )
-
-        all_scores = torch.cat([prefix_scores, exact_scores], dim=-1)
-        all_weights = torch.softmax(all_scores, dim=-1, dtype=torch.float32).to(query.dtype)
-
-        result = query.new_zeros((batch, self.num_heads, self._real_head_size))
-        prefix_tokens = prefix_scores.shape[-1]
-        if prefix_tokens > 0:
-            result += cuda_quantized_bmm_gqa_dynamic(
-                self._qjl_value_group_size,
-                all_weights[..., :prefix_tokens].unsqueeze(2),
-                value_pack,
-                value_scale,
-                value_min,
-                self._qjl_value_bits,
-            ).squeeze(2)
-        if max_exact_tokens > 0:
-            result += torch.einsum(
-                "bhk,bhkd->bhd",
-                all_weights[..., prefix_tokens:],
-                exact_value,
-            )
-
         output[:num_actual].copy_(result)
         return output
 
@@ -1138,4 +955,105 @@ class TurboQuantAttentionImpl(FlashAttentionImpl):
             v_descale=layer._v_scale.expand(descale_shape),
             num_splits=1 if self.batch_invariant_enabled else 0,
         )
+        return output
+
+    def _forward_qjl_prefix_prefill(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        packed_cache = kv_cache[0]
+        proj_dir_score, _ = self._get_qjl_projection(query.device)
+        rotation = self._get_rotation(query.dtype, query.device)
+        q_per_kv = self.num_heads // self.num_kv_heads
+        block_size = packed_cache.shape[2]
+
+        query_lens = attn_metadata.query_start_loc[1:] - attn_metadata.query_start_loc[:-1]
+        seq_lens = attn_metadata.seq_lens[: query_lens.shape[0]]
+        prefix_lens = seq_lens - query_lens
+        block_table = attn_metadata.block_table[: query_lens.shape[0]]
+
+        for req_idx, q_len_tensor in enumerate(query_lens.tolist()):
+            q_len = int(q_len_tensor)
+            start = int(attn_metadata.query_start_loc[req_idx].item())
+            stop = start + q_len
+
+            q_chunk = query[start:stop]
+            k_chunk = key[start:stop]
+            v_chunk = value[start:stop]
+            prefix_len = int(prefix_lens[req_idx].item())
+            num_prefix_blocks = (prefix_len + block_size - 1) // block_size
+
+            if prefix_len > 0 and num_prefix_blocks > 0:
+                comp_block_table = block_table[req_idx, :num_prefix_blocks].to(
+                    device=query.device,
+                    dtype=block_table.dtype,
+                )
+                packed_scores, value_pack, value_scale, value_min = packed_qjl_prefix_scores_multi_query(
+                    q_chunk,
+                    packed_cache=packed_cache,
+                    block_table=comp_block_table,
+                    seq_len=prefix_len,
+                    proj_dir_score=proj_dir_score,
+                    scale=self.scale,
+                    rotation=rotation,
+                    outlier_count=self._qjl_outlier_count,
+                    value_group_size=self._qjl_value_group_size,
+                    value_bits=self._qjl_value_bits,
+                )
+                prefix_scores = packed_scores.to(torch.float32)
+                prefix_value_pack = value_pack.unsqueeze(0)
+                prefix_value_scale = value_scale.unsqueeze(0)
+                prefix_value_min = value_min.unsqueeze(0)
+            else:
+                prefix_scores = query.new_empty((q_len, self.num_heads, 0), dtype=torch.float32)
+                prefix_value_pack = query.new_empty(
+                    (1, self.num_kv_heads, 0, self._real_head_size * self._qjl_value_bits // 32),
+                    dtype=torch.int32,
+                )
+                prefix_value_scale = query.new_empty(
+                    (1, self.num_kv_heads, 0, self._real_head_size // self._qjl_value_group_size)
+                )
+                prefix_value_min = torch.empty_like(prefix_value_scale)
+
+            local_key = k_chunk.repeat_interleave(q_per_kv, dim=1)
+            local_value = v_chunk.repeat_interleave(q_per_kv, dim=1)
+            local_scores = torch.einsum(
+                "qhd,khd->qhk",
+                q_chunk.to(torch.float32),
+                local_key.to(torch.float32),
+            ) * self.scale
+            causal_mask = torch.triu(
+                torch.ones(q_len, q_len, device=query.device, dtype=torch.bool),
+                diagonal=1,
+            )
+            local_scores = local_scores.masked_fill(causal_mask.unsqueeze(1), float("-inf"))
+
+            all_scores = torch.cat([prefix_scores, local_scores], dim=-1)
+            all_weights = torch.softmax(all_scores, dim=-1, dtype=torch.float32).to(query.dtype)
+
+            req_out = query.new_zeros((q_len, self.num_heads, self._real_head_size))
+            prefix_tokens = prefix_scores.shape[-1]
+
+            if prefix_tokens > 0:
+                req_out += cuda_quantized_bmm_gqa_dynamic(
+                    self._qjl_value_group_size,
+                    all_weights[:, :, :prefix_tokens].permute(1, 0, 2).unsqueeze(0),
+                    prefix_value_pack,
+                    prefix_value_scale,
+                    prefix_value_min,
+                    self._qjl_value_bits,
+                ).squeeze(0).permute(1, 0, 2)
+
+            req_out += torch.einsum(
+                "qhk,khd->qhd",
+                all_weights[:, :, prefix_tokens:],
+                local_value,
+            )
+            output[start:stop].copy_(req_out)
+
         return output
