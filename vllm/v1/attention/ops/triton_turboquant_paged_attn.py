@@ -396,8 +396,15 @@ def _adaptive_kv_splits(num_seqs: int, num_kv_heads: int,
 
     progs  = num_seqs * num_kv_heads
 
-    target = _SM_COUNT * 32          # ~4224 programs for H100
+    # CRITICAL FIX: Original target of 32 × SM_COUNT was too aggressive at high
+    # concurrency. At 64 requests, this launches 4096 programs competing for
+    # SM resources, causing register pressure and reduced occupancy.
+    #
+    # New strategy: Cap total programs at ~2K (15 waves @ 132 SMs).
+    # This balances parallelism with per-program resource availability.
+    target = _SM_COUNT * 16          # ~2112 programs for H100
     needed = max(1, (target + progs - 1) // progs)
+
     # GPT-OSS/H100 sweeps favor fewer splits at ~8k (512 blocks) but more
     # splits again once per-sequence context reaches ~16k (1024 blocks).
     if max_blocks >= 1024:
@@ -519,21 +526,29 @@ def turboquant_fused_paged_decode(
     # decode region we care about, even when blocks_per_split reaches 64.
     env_warps = _os.environ.get("TURBOQUANT_SPLIT_WARPS")
     env_stages = _os.environ.get("TURBOQUANT_SPLIT_STAGES")
+    # CRITICAL FIX: Increase default warps from 4 to 8. With GQA_RATIO=8,
+    # each kernel processes 8 Q heads. More warps = better occupancy and
+    # latency hiding on H100 (which has 128 warps/SM).
     num_warps = (
         split_num_warps
         if split_num_warps is not None
-        else (int(env_warps) if env_warps else 4)
+        else (int(env_warps) if env_warps else 8)
     )
-    # Tune staging by per-program KV chunk size. Smaller chunks benefit from
-    # deeper pipelining; longer chunks need lower register pressure.
+    # CRITICAL FIX: The original heuristic was inverted and disabled pipelining
+    # at high concurrency. At 64 requests, blocks_per_split=512 triggered
+    # num_stages=1 (no pipelining), causing 99% memory stalls.
+    #
+    # Correct logic: MORE pipelining for LARGER chunks to hide memory latency.
+    # Small chunks (fast kernels) don't benefit as much from deep pipelining.
+    # Large chunks (slow kernels) NEED deep pipelining to overlap loads with compute.
     num_stages = (
         split_num_stages
         if split_num_stages is not None
         else (
             int(env_stages) if env_stages else (
-                1 if blocks_per_split >= 128
-                else 2 if blocks_per_split >= 64
-                else 3
+                4 if blocks_per_split >= 256  # High concurrency: max pipelining
+                else 3 if blocks_per_split >= 128
+                else 2
             )
         )
     )
