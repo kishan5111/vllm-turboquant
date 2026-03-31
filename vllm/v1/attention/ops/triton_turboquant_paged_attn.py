@@ -390,6 +390,10 @@ def _adaptive_kv_splits(num_seqs: int, num_kv_heads: int,
         specialisation is reused across identical calls.
       • kv_splits=1 → WRITE_DIRECT fast path (no merge kernel at all).
     """
+    env_override = _os.environ.get("TURBOQUANT_KV_SPLITS")
+    if env_override is not None:
+        return int(env_override)
+
     progs  = num_seqs * num_kv_heads
 
     target = _SM_COUNT * 32          # ~4224 programs for H100
@@ -513,10 +517,12 @@ def turboquant_fused_paged_decode(
 
     # H100/GPT-OSS tuning: 4 split warps consistently wins in the 8k/16k
     # decode region we care about, even when blocks_per_split reaches 64.
+    env_warps = _os.environ.get("TURBOQUANT_SPLIT_WARPS")
+    env_stages = _os.environ.get("TURBOQUANT_SPLIT_STAGES")
     num_warps = (
         split_num_warps
         if split_num_warps is not None
-        else 4
+        else (int(env_warps) if env_warps else 4)
     )
     # Tune staging by per-program KV chunk size. Smaller chunks benefit from
     # deeper pipelining; longer chunks need lower register pressure.
@@ -524,9 +530,11 @@ def turboquant_fused_paged_decode(
         split_num_stages
         if split_num_stages is not None
         else (
-            1 if blocks_per_split >= 128
-            else 2 if blocks_per_split >= 64
-            else 3
+            int(env_stages) if env_stages else (
+                1 if blocks_per_split >= 128
+                else 2 if blocks_per_split >= 64
+                else 3
+            )
         )
     )
 
@@ -567,10 +575,11 @@ def turboquant_fused_paged_decode(
             dtype=torch.bfloat16, device=query.device,
         )
         # H100 sweeps favored 4 merge warps across the GPT-OSS gate workloads.
+        env_merge_warps = _os.environ.get("TURBOQUANT_MERGE_WARPS")
         merge_warps = (
             merge_num_warps
             if merge_num_warps is not None
-            else 4
+            else (int(env_merge_warps) if env_merge_warps else 4)
         )
         _tq_merge_splits_kernel[(num_seqs, num_q_heads)](
             partial_acc, partial_m, partial_l, out_rot,

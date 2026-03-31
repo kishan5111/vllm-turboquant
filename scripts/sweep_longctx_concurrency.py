@@ -39,14 +39,20 @@ def _parse_ctx_spec(spec: str) -> tuple[int, list[int]]:
     return ctx_len, req_counts
 
 
+def _kv_block_size(kv_dtype: str) -> int | None:
+    if kv_dtype == "turboquant_qjl":
+        return 32
+    return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="openai/gpt-oss-20b")
     parser.add_argument(
         "--kv-dtypes",
         nargs="+",
-        default=["fp8", "turboquant_4bit"],
-        choices=["fp8", "turboquant_4bit"],
+        default=["fp8", "turboquant_qjl"],
+        choices=["fp8", "turboquant_4bit", "turboquant_qjl"],
     )
     parser.add_argument("--max-model-len", type=int, default=69632)
     parser.add_argument("--gpu-util", type=float, default=0.93)
@@ -78,6 +84,9 @@ def main() -> None:
 
     for kv_dtype in args.kv_dtypes:
         resolved_cudagraph_mode = _resolve_cudagraph_mode("auto", kv_dtype)
+        enable_chunked_prefill = kv_dtype != "turboquant_qjl"
+        if kv_dtype == "turboquant_qjl":
+            print("Using non-chunked prefill for turboquant_qjl (stability workaround).")
         print(f"\n{'='*60}")
         print(f"Backend  : {kv_dtype}")
         print(f"Model    : {args.model}")
@@ -86,7 +95,7 @@ def main() -> None:
         print(f"CUDAGraph: {resolved_cudagraph_mode}")
         print(f"{'='*60}")
 
-        llm = LLM(
+        llm_kwargs = dict(
             model=args.model,
             kv_cache_dtype=kv_dtype,
             max_model_len=args.max_model_len,
@@ -94,9 +103,14 @@ def main() -> None:
             disable_log_stats=False,
             enable_prefix_caching=False,
             enforce_eager=False,
-            enable_chunked_prefill=True,
+            enable_chunked_prefill=enable_chunked_prefill,
             compilation_config={"cudagraph_mode": resolved_cudagraph_mode},
         )
+        block_size = _kv_block_size(kv_dtype)
+        if block_size is not None:
+            llm_kwargs["block_size"] = block_size
+
+        llm = LLM(**llm_kwargs)
 
         backend_rows: list[dict] = []
         for ctx_len, req_counts in sweep_map.items():

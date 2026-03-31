@@ -605,6 +605,122 @@ def _qjl_stage12_score_kernel(
     )
 
 
+@triton.jit
+def _qjl_stage12_score_multi_query_kernel(
+    query_ptr,
+    q_hash_ptr,
+    q_norm_ptr,
+    key_pack_ptr,
+    key_scale_ptr,
+    residual_hash_ptr,
+    residual_norm_ptr,
+    seq_len,
+    total_tokens,
+    scores_ptr,
+    stride_q_t, stride_q_h, stride_q_d,
+    stride_qhash_t, stride_qhash_h, stride_qhash_byte,
+    stride_qnorm_t, stride_qnorm_h,
+    stride_kp_h, stride_kp_t, stride_kp_byte,
+    stride_ks_h, stride_ks_t,
+    stride_rh_h, stride_rh_t, stride_rh_byte,
+    stride_rn_h, stride_rn_t,
+    stride_s_t, stride_s_h, stride_s_tok,
+    GQA_RATIO: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    SKETCH_DIM: tl.constexpr,
+    HASH_BYTES: tl.constexpr,
+    PACK_BYTES: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+    SCORE_SCALE: tl.constexpr,
+):
+    """Stage-1/2 fused scorer for many query tokens against one shared prefix.
+
+    Grid: (q_len, q_heads, ceil_div(total_tokens, BLOCK_TOKENS))
+    """
+    q_tok = tl.program_id(0)
+    qh = tl.program_id(1)
+    tok_blk = tl.program_id(2)
+    kh = qh // GQA_RATIO
+
+    tok_offsets = tok_blk * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
+    tok_in_bounds = tok_offsets < total_tokens
+    tok_mask = tok_offsets < seq_len
+
+    q_base = q_tok * stride_q_t + qh * stride_q_h
+    qhash_base = q_tok * stride_qhash_t + qh * stride_qhash_h
+    q_norm = tl.load(q_norm_ptr + q_tok * stride_qnorm_t + qh * stride_qnorm_h).to(
+        tl.float32
+    )
+
+    coarse = tl.zeros((BLOCK_TOKENS,), dtype=tl.float32)
+    mismatches = tl.zeros((BLOCK_TOKENS,), dtype=tl.int32)
+    key_scale = tl.load(
+        key_scale_ptr
+        + kh * stride_ks_h
+        + tok_offsets * stride_ks_t,
+        mask=tok_in_bounds,
+        other=0,
+    ).to(tl.float32)
+
+    for byte_i in range(PACK_BYTES):
+        packed = tl.load(
+            key_pack_ptr
+            + kh * stride_kp_h
+            + tok_offsets * stride_kp_t
+            + byte_i * stride_kp_byte,
+            mask=tok_in_bounds,
+            other=0,
+        ).to(tl.int32)
+
+        q0 = tl.load(query_ptr + q_base + (byte_i * 4 + 0) * stride_q_d).to(tl.float32)
+        q1 = tl.load(query_ptr + q_base + (byte_i * 4 + 1) * stride_q_d).to(tl.float32)
+        q2 = tl.load(query_ptr + q_base + (byte_i * 4 + 2) * stride_q_d).to(tl.float32)
+        q3 = tl.load(query_ptr + q_base + (byte_i * 4 + 3) * stride_q_d).to(tl.float32)
+
+        v0 = (((packed >> 0) & 0x3).to(tl.float32) / 1.5 - 1.0) * key_scale
+        v1 = (((packed >> 2) & 0x3).to(tl.float32) / 1.5 - 1.0) * key_scale
+        v2 = (((packed >> 4) & 0x3).to(tl.float32) / 1.5 - 1.0) * key_scale
+        v3 = (((packed >> 6) & 0x3).to(tl.float32) / 1.5 - 1.0) * key_scale
+
+        coarse += q0 * v0 + q1 * v1 + q2 * v2 + q3 * v3
+
+    for byte_i in range(HASH_BYTES):
+        q_byte = tl.load(q_hash_ptr + qhash_base + byte_i * stride_qhash_byte).to(tl.int32)
+        k_byte = tl.load(
+            residual_hash_ptr
+            + kh * stride_rh_h
+            + tok_offsets * stride_rh_t
+            + byte_i * stride_rh_byte,
+            mask=tok_in_bounds,
+            other=0,
+        ).to(tl.int32)
+        x = q_byte ^ k_byte
+        x = x - ((x >> 1) & 0x55)
+        x = (x & 0x33) + ((x >> 2) & 0x33)
+        x = (x + (x >> 4)) & 0x0F
+        mismatches += x
+
+    residual_norm = tl.load(
+        residual_norm_ptr
+        + kh * stride_rn_h
+        + tok_offsets * stride_rn_t,
+        mask=tok_in_bounds,
+        other=0,
+    ).to(tl.float32)
+    centered = (SKETCH_DIM - 2.0 * mismatches.to(tl.float32)) / SKETCH_DIM
+    score = (coarse + centered * q_norm * residual_norm) * SCORE_SCALE
+    score = tl.where(tok_mask, score, float("-inf"))
+
+    tl.store(
+        scores_ptr
+        + q_tok * stride_s_t
+        + qh * stride_s_h
+        + tok_offsets * stride_s_tok,
+        score,
+        mask=tok_in_bounds,
+    )
+
+
 def qjl_score_stage12_triton(
     query: torch.Tensor,
     q_hash_packed: torch.Tensor,
@@ -672,6 +788,217 @@ def qjl_score_stage12_triton(
     )
 
     return scores
+
+
+def qjl_score_stage12_multi_query_triton(
+    query: torch.Tensor,
+    q_hash_packed: torch.Tensor,
+    q_norms: torch.Tensor,
+    key_pack: torch.Tensor,
+    key_scale: torch.Tensor,
+    residual_hash_packed: torch.Tensor,
+    residual_norm: torch.Tensor,
+    *,
+    seq_len: int,
+    gqa_ratio: int,
+    scale: float,
+    sketch_dim: int,
+) -> torch.Tensor:
+    """Fused stage-1/stage-2 score for many query tokens vs one shared prefix."""
+    q_len, q_heads, head_size = query.shape
+    _, total_tokens, pack_bytes = key_pack.shape
+    hash_bytes = q_hash_packed.shape[-1]
+
+    scores = torch.empty(
+        q_len, q_heads, total_tokens,
+        dtype=torch.float32,
+        device=query.device,
+    )
+
+    query_c = query.contiguous()
+    q_hash_c = q_hash_packed.contiguous()
+    q_norms_c = q_norms.contiguous()
+    key_pack_c = key_pack.contiguous()
+    key_scale_c = key_scale.contiguous()
+    residual_hash_c = residual_hash_packed.contiguous()
+    residual_norm_c = residual_norm.contiguous()
+
+    block_tokens = 32
+    grid = (q_len, q_heads, triton.cdiv(total_tokens, block_tokens))
+    _qjl_stage12_score_multi_query_kernel[grid](
+        query_c,
+        q_hash_c,
+        q_norms_c,
+        key_pack_c,
+        key_scale_c,
+        residual_hash_c,
+        residual_norm_c,
+        seq_len,
+        total_tokens,
+        scores,
+        query_c.stride(0), query_c.stride(1), query_c.stride(2),
+        q_hash_c.stride(0), q_hash_c.stride(1), q_hash_c.stride(2),
+        q_norms_c.stride(0), q_norms_c.stride(1),
+        key_pack_c.stride(0), key_pack_c.stride(1), key_pack_c.stride(2),
+        key_scale_c.stride(0), key_scale_c.stride(1),
+        residual_hash_c.stride(0), residual_hash_c.stride(1), residual_hash_c.stride(2),
+        residual_norm_c.stride(0), residual_norm_c.stride(1),
+        scores.stride(0), scores.stride(1), scores.stride(2),
+        GQA_RATIO=gqa_ratio,
+        HEAD_SIZE=head_size,
+        SKETCH_DIM=sketch_dim,
+        HASH_BYTES=hash_bytes,
+        PACK_BYTES=pack_bytes,
+        BLOCK_TOKENS=block_tokens,
+        SCORE_SCALE=scale,
+        num_warps=4,
+        num_stages=1,
+    )
+    return scores
+
+
+@triton.jit
+def _qjl_local_causal_attn_kernel(
+    query_ptr,
+    key_ptr,
+    value_ptr,
+    output_ptr,
+    lse_ptr,
+    stride_q_t,
+    stride_q_h,
+    stride_q_d,
+    stride_k_t,
+    stride_k_h,
+    stride_k_d,
+    stride_v_t,
+    stride_v_h,
+    stride_v_d,
+    stride_o_t,
+    stride_o_h,
+    stride_o_d,
+    stride_lse_t,
+    stride_lse_h,
+    kv_len,
+    q_start,
+    GQA_RATIO: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+    MAX_K_BLOCKS: tl.constexpr,
+    SCORE_SCALE: tl.constexpr,
+):
+    """Fused local causal attention with online softmax.
+
+    Grid: (q_slice_len, q_heads)
+    """
+    q_local = tl.program_id(0)
+    qh = tl.program_id(1)
+    kh = qh // GQA_RATIO
+    q_tok = q_start + q_local
+
+    d_offsets = tl.arange(0, HEAD_SIZE)
+    q_ptr = query_ptr + q_local * stride_q_t + qh * stride_q_h + d_offsets * stride_q_d
+    q_vec = tl.load(q_ptr).to(tl.float32)
+
+    m = tl.full((), -float("inf"), dtype=tl.float32)
+    l = tl.zeros((), dtype=tl.float32)
+    acc = tl.zeros((HEAD_SIZE,), dtype=tl.float32)
+
+    for k_blk in range(MAX_K_BLOCKS):
+        k_offsets = k_blk * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
+        valid = (k_offsets < kv_len) & (k_offsets <= q_tok)
+        valid_exp = valid[:, None]
+
+        k_ptr = (
+            key_ptr
+            + k_offsets[:, None] * stride_k_t
+            + kh * stride_k_h
+            + d_offsets[None, :] * stride_k_d
+        )
+        v_ptr = (
+            value_ptr
+            + k_offsets[:, None] * stride_v_t
+            + kh * stride_v_h
+            + d_offsets[None, :] * stride_v_d
+        )
+        k_block = tl.load(k_ptr, mask=valid_exp, other=0).to(tl.float32)
+        v_block = tl.load(v_ptr, mask=valid_exp, other=0).to(tl.float32)
+
+        scores = tl.sum(k_block * q_vec[None, :], axis=1) * SCORE_SCALE
+        scores = tl.where(valid, scores, -float("inf"))
+        block_m = tl.max(scores, axis=0)
+        m_new = tl.maximum(m, block_m)
+        alpha = tl.exp(m - m_new)
+        p = tl.exp(scores - m_new)
+
+        acc = acc * alpha + tl.sum(p[:, None] * v_block, axis=0)
+        l = l * alpha + tl.sum(p, axis=0)
+        m = m_new
+
+    out_vec = acc / l
+    lse = m + tl.log(l)
+
+    o_ptr = output_ptr + q_local * stride_o_t + qh * stride_o_h + d_offsets * stride_o_d
+    tl.store(o_ptr, out_vec)
+    tl.store(lse_ptr + q_local * stride_lse_t + qh * stride_lse_h, lse)
+
+
+def qjl_local_causal_attn_triton(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    gqa_ratio: int,
+    scale: float,
+    q_start: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute local causal attention output and per-row logsumexp.
+
+    Args:
+        query: [q_len, q_heads, head_size]
+        key: [q_len, kv_heads, head_size]
+        value: [q_len, kv_heads, head_size]
+    Returns:
+        output: [q_len, q_heads, head_size]
+        lse: [q_len, q_heads] (float32)
+    """
+    q_slice_len, q_heads, head_size = query.shape
+    kv_len = key.shape[0]
+    assert value.shape[0] == kv_len
+
+    query_c = query.contiguous()
+    key_c = key.contiguous()
+    value_c = value.contiguous()
+
+    output = torch.empty_like(query_c)
+    lse = torch.empty(
+        (q_slice_len, q_heads), dtype=torch.float32, device=query.device
+    )
+
+    block_tokens = 32
+    max_k_blocks = triton.cdiv(kv_len, block_tokens)
+    grid = (q_slice_len, q_heads)
+    _qjl_local_causal_attn_kernel[grid](
+        query_c,
+        key_c,
+        value_c,
+        output,
+        lse,
+        query_c.stride(0), query_c.stride(1), query_c.stride(2),
+        key_c.stride(0), key_c.stride(1), key_c.stride(2),
+        value_c.stride(0), value_c.stride(1), value_c.stride(2),
+        output.stride(0), output.stride(1), output.stride(2),
+        lse.stride(0), lse.stride(1),
+        kv_len,
+        q_start,
+        GQA_RATIO=gqa_ratio,
+        HEAD_SIZE=head_size,
+        BLOCK_TOKENS=block_tokens,
+        MAX_K_BLOCKS=max_k_blocks,
+        SCORE_SCALE=scale,
+        num_warps=4,
+        num_stages=1,
+    )
+    return output, lse
 
 
 # =============================================================================

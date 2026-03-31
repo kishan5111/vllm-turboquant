@@ -1,0 +1,40 @@
+{
+  "config": {
+    "model": "/workspace/.hf_home/hub/models--openai--gpt-oss-20b/snapshots/6cee5e81ee83917806bbde320786a8fb61efebee",
+    "kv_dtype": "fp8",
+    "attention_backend": null,
+    "enforce_eager": false,
+    "no_chunked_prefill": false,
+    "output": "results/6cee5e81ee83917806bbde320786a8fb61efebee_fp8_baseline.json",
+    "max_model_len": 69632,
+    "gpu_util": 0.93,
+    "workloads": [
+      "ctx65k"
+    ],
+    "profile_turboquant_paths": false,
+    "cudagraph_mode": "full_decode_only"
+  },
+  "resolved_cudagraph_mode": "full_decode_only",
+  "results": [
+    {
+      "workload": "ctx65k",
+      "backend": "fp8",
+      "num_requests": 2,
+      "input_len": 65536,
+      "output_len": 64,
+      "total_time_s": 3.537,
+      "total_output_tokens": 128,
+      "output_tok_per_s": 36.2,
+      "request_per_s": 0.57,
+      "p99_latency_s": 0,
+      "mean_ttft_s": 2.397,
+      "mean_prefill_s": 1.842,
+      "mean_decode_s": 1.094,
+      "mean_tpot_ms": 17.365,
+      "post_first_token_tok_per_s": 57.6,
+      "peak_vram_gb": 0.0,
+      "effective_kv_bytes_per_token": 2048
+    }
+  ],
+  "profile": []
+}

@@ -62,11 +62,20 @@ try:
         packed_qjl_prefix_scores_multi_query,
         qjl_packed_slot_size,
     )
+    from vllm.v1.attention.ops.qjl_kernels import (
+        qjl_local_causal_attn_triton,
+    )
     _QJL_AVAILABLE = True
 except ImportError:
     _QJL_AVAILABLE = False
 from vllm.v1.attention.ops.triton_turboquant_paged_attn import (
     turboquant_fused_paged_decode,
+)
+from vllm.v1.attention.ops.triton_turboquant_prefill import (
+    turboquant_context_attention_fwd,
+)
+from vllm.v1.attention.ops.turboquant_minikv_fused_attention import (
+    turboquant_minikv_fused_decode,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -91,12 +100,17 @@ _PREFILL_TIMINGS: dict[str, float] = {
     "flash_attn_ms": 0.0,
     "inverse_rotate_ms": 0.0,
     "num_unique_blocks": 0.0,
+    "qjl_prefix_calls": 0.0,
+    "qjl_prefix_score_ms": 0.0,
+    "qjl_prefix_value_ms": 0.0,
+    "qjl_local_score_ms": 0.0,
+    "qjl_local_value_ms": 0.0,
 }
 
 
 def _time_cuda_section(fn):
     if not _PROFILE_PREFILL:
-        return fn()
+        return fn(), 0.0
     torch.cuda.synchronize()
     start = time.perf_counter()
     out = fn()
@@ -130,6 +144,16 @@ def _dump_prefill_timings() -> None:
     ):
         summary[f"avg_{key}"] = _PREFILL_TIMINGS[key] / calls
 
+    qjl_calls = _PREFILL_TIMINGS.get("qjl_prefix_calls", 0.0)
+    if qjl_calls > 0:
+        for key in (
+            "qjl_prefix_score_ms",
+            "qjl_prefix_value_ms",
+            "qjl_local_score_ms",
+            "qjl_local_value_ms",
+        ):
+            summary[f"avg_{key}"] = _PREFILL_TIMINGS[key] / qjl_calls
+
     out_path = os.environ.get(
         "TURBOQUANT_PROFILE_PREFILL_PATH",
         f"/tmp/turboquant_prefill_timing_{os.getpid()}.json",
@@ -149,6 +173,33 @@ def _maybe_flush_prefill_timings() -> None:
 
 
 atexit.register(_dump_prefill_timings)
+
+
+def _qjl_local_scores(
+    q_slice: torch.Tensor,
+    local_key_f32: torch.Tensor,
+    scale: float,
+    q_start: int,
+    k_positions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    local_scores = torch.einsum(
+        "qhd,khd->qhk",
+        q_slice.to(torch.float32),
+        local_key_f32,
+    ) * scale
+    q_positions = torch.arange(
+        q_start,
+        q_start + q_slice.shape[0],
+        device=q_slice.device,
+        dtype=torch.int64,
+    )[:, None]
+    causal_mask = k_positions > q_positions
+    local_scores = local_scores.masked_fill(causal_mask.unsqueeze(1), float("-inf"))
+    local_lse = torch.logsumexp(local_scores, dim=-1)
+    local_weights = torch.softmax(local_scores, dim=-1, dtype=torch.float32).to(
+        q_slice.dtype
+    )
+    return local_scores, local_lse, local_weights
 
 
 def _turboquant_bits(cache_dtype: str) -> int:
@@ -671,65 +722,135 @@ class TurboQuantAttentionImpl(FlashAttentionImpl):
                 query, kv_cache, attn_metadata, output
             )
 
+        # Experimental fused prefill path (packed TurboQuant cache read directly
+        # in Triton). Keep behind a flag and preserve existing fallback.
+        use_fused_prefill = (
+            os.environ.get("TURBOQUANT_USE_FUSED_PREFILL", "0") == "1"
+            and attn_metadata.max_query_len > 1
+            and not attn_metadata.use_cascade
+        )
+        has_cached_prefix_ctx = False
+        if use_fused_prefill:
+            num_reqs = attn_metadata.query_start_loc.shape[0] - 1
+            seq_lens = attn_metadata.seq_lens[:num_reqs]
+            query_lens = (
+                attn_metadata.query_start_loc[1:num_reqs + 1]
+                - attn_metadata.query_start_loc[:num_reqs]
+            )
+            has_cached_prefix_ctx = bool(torch.any(seq_lens > query_lens).item())
+
+        if use_fused_prefill and has_cached_prefix_ctx:
+            try:
+                num_actual = attn_metadata.num_actual_tokens
+                num_reqs = attn_metadata.query_start_loc.shape[0] - 1
+                block_table = attn_metadata.block_table[:num_reqs]
+                seq_lens = attn_metadata.seq_lens[:num_reqs]
+                comp_key_cache, comp_value_cache = kv_cache.unbind(0)
+
+                R = self._get_rotation(query.dtype, query.device)
+                q_rot = apply_rotation(query[:num_actual], R)
+                # Keep K/V chunk in the same form as the existing prefill path
+                # to avoid extra eager GEMMs on the Python side.
+                k_rot = key[:num_actual]
+                v_rot = value[:num_actual]
+
+                turboquant_context_attention_fwd(
+                    q=q_rot,
+                    k=k_rot,
+                    v=v_rot,
+                    o=output[:num_actual],
+                    k_cache=comp_key_cache,
+                    v_cache=comp_value_cache,
+                    b_loc=block_table,
+                    b_start_loc=attn_metadata.query_start_loc,
+                    b_seq_len=seq_lens,
+                    max_input_len=attn_metadata.max_query_len,
+                    sm_scale=self.scale,
+                    sliding_window=(
+                        self.sliding_window[0]
+                        if isinstance(self.sliding_window, tuple)
+                        else self.sliding_window
+                    ),
+                    skip_decode=True,
+                )
+                if not self._value_output_folded:
+                    output[:num_actual].copy_(apply_rotation(output[:num_actual], R.T))
+                return output
+            except Exception as e:
+                # Fall back to the proven decompress+FlashAttention path.
+                import sys
+                print(f"[TURBOQUANT] Fused prefill failed, falling back: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+                pass
+
         comp_key_cache, comp_value_cache = kv_cache.unbind(0)
         # comp_key_cache: [num_blocks, num_kv_heads, block_size, comp_head] UINT8
         # (coalesced layout: kv_head before position)
 
         block_size     = comp_key_cache.shape[2]  # dim 2 in new layout
 
-        # ---- 1. Gather the unique block indices needed this step ----
+        # ---- 1. Gather used block IDs + remap block table in one pass ----
         num_reqs = attn_metadata.query_start_loc.shape[0] - 1
         block_table = attn_metadata.block_table[:num_reqs]  # [batch, max_blocks]
         seq_lens = attn_metadata.seq_lens[:num_reqs]
-        if _PROFILE_PREFILL:
-            def _gather_unique() -> tuple[torch.Tensor, torch.Tensor]:
-                blocks_needed = torch.div(
-                    seq_lens + (block_size - 1),
-                    block_size,
-                    rounding_mode="floor",
-                )
-                block_positions = torch.arange(
-                    block_table.shape[1], device=block_table.device
-                )
-                used_mask = block_positions.unsqueeze(0) < blocks_needed.unsqueeze(1)
-                valid = block_table[used_mask]
-                valid = valid[valid >= 0]
-                return used_mask, torch.unique(valid)
-
-            (used_mask, unique_blk_ids), gather_ms = _time_cuda_section(_gather_unique)
-        else:
-            blocks_needed = torch.div(
-                seq_lens + (block_size - 1),
-                block_size,
-                rounding_mode="floor",
-            )
-            block_positions = torch.arange(
-                block_table.shape[1], device=block_table.device
-            )
-            used_mask = block_positions.unsqueeze(0) < blocks_needed.unsqueeze(1)
-            valid = block_table[used_mask]
-            valid = valid[valid >= 0]
-            unique_blk_ids = torch.unique(valid)
-            gather_ms = 0.0
-        num_unique = unique_blk_ids.shape[0]
-
-        # ---- 2. Decompress those blocks into a temporary BF16 buffer ----
-        decomp_key = torch.empty(
-            (num_unique, block_size, self.num_kv_heads, self._real_head_size),
-            dtype=query.dtype, device=query.device,
+        blocks_needed = torch.div(
+            seq_lens + (block_size - 1),
+            block_size,
+            rounding_mode="floor",
         )
-        decomp_value = torch.empty_like(decomp_key)
+        block_positions = torch.arange(block_table.shape[1], device=block_table.device)
+        used_mask = block_positions.unsqueeze(0) < blocks_needed.unsqueeze(1)
+        # Some used positions may still be -1 in edge cases; filter explicitly.
+        used_valid_mask = used_mask & (block_table >= 0)
+
+        if _PROFILE_PREFILL:
+            valid_blocks, gather_ms = _time_cuda_section(
+                lambda: block_table[used_valid_mask]
+            )
+            inverse = torch.arange(
+                valid_blocks.numel(), dtype=block_table.dtype, device=block_table.device
+            )
+            remapped_bt = torch.full_like(block_table, -1)
+            remapped_bt[used_valid_mask] = inverse
+            remap_ms = 0.0
+        else:
+            valid_blocks = block_table[used_valid_mask]
+            inverse = torch.arange(
+                valid_blocks.numel(), dtype=block_table.dtype, device=block_table.device
+            )
+            remapped_bt = torch.full_like(block_table, -1)
+            remapped_bt[used_valid_mask] = inverse
+            gather_ms = 0.0
+            remap_ms = 0.0
+        block_ids = valid_blocks
+        num_blocks_dense = block_ids.shape[0]
+
+        # ---- 2. Decompress those blocks into temporary BF16 buffers ----
+        # Allocate in [2, ...] layout directly so we can avoid an extra
+        # torch.stack() copy before calling super().forward.
+        dense_kv_cache = torch.empty(
+            (
+                2,
+                num_blocks_dense,
+                block_size,
+                self.num_kv_heads,
+                self._real_head_size,
+            ),
+            dtype=query.dtype,
+            device=query.device,
+        )
+        decomp_key = dense_kv_cache[0]
+        decomp_value = dense_kv_cache[1]
 
         if _PROFILE_PREFILL:
             def _do_decompress() -> None:
-                turboquant_decompress_blocks(comp_key_cache, unique_blk_ids,
+                turboquant_decompress_blocks(comp_key_cache, block_ids,
                                              decomp_key)
-                turboquant_decompress_blocks(comp_value_cache, unique_blk_ids,
+                turboquant_decompress_blocks(comp_value_cache, block_ids,
                                              decomp_value)
             _, decompress_ms = _time_cuda_section(_do_decompress)
         else:
-            turboquant_decompress_blocks(comp_key_cache, unique_blk_ids, decomp_key)
-            turboquant_decompress_blocks(comp_value_cache, unique_blk_ids, decomp_value)
+            turboquant_decompress_blocks(comp_key_cache, block_ids, decomp_key)
+            turboquant_decompress_blocks(comp_value_cache, block_ids, decomp_value)
             decompress_ms = 0.0
 
         # Keep decompressed K/V in rotated space and rotate the current query
@@ -745,87 +866,45 @@ class TurboQuantAttentionImpl(FlashAttentionImpl):
             query_rot = apply_rotation(query[:num_actual], R)
             rotate_q_ms = 0.0
 
-        # ---- 3. Remap block_table to indices in [0, num_unique) ----
-        if _PROFILE_PREFILL:
-            def _remap_blocks() -> torch.Tensor:
-                remapped_bt = torch.full_like(block_table, -1)
-                if num_unique > 0:
-                    max_blk = int(unique_blk_ids.max().item())
-                    remap = torch.full(
-                        (max_blk + 2,),
-                        -1,
-                        dtype=block_table.dtype,
-                        device=block_table.device,
-                    )
-                    remap[unique_blk_ids] = torch.arange(
-                        num_unique, dtype=block_table.dtype, device=block_table.device
-                    )
-                    remapped_src = remap[block_table.clamp(min=0)]
-                    remapped_bt[used_mask] = remapped_src[used_mask]
-                return remapped_bt
-
-            remapped_bt, remap_ms = _time_cuda_section(_remap_blocks)
-        else:
-            remapped_bt = torch.full_like(block_table, -1)
-            if num_unique > 0:
-                max_blk = int(unique_blk_ids.max().item())
-                remap = torch.full(
-                    (max_blk + 2,),
-                    -1,
-                    dtype=block_table.dtype,
-                    device=block_table.device,
-                )
-                remap[unique_blk_ids] = torch.arange(
-                    num_unique, dtype=block_table.dtype, device=block_table.device
-                )
-                remapped_src = remap[block_table.clamp(min=0)]
-                remapped_bt[used_mask] = remapped_src[used_mask]
-            remap_ms = 0.0
-
-        # ---- 4. Run standard FlashAttention on the decompressed buffers ----
+        # ---- 3. Run standard FlashAttention on the decompressed buffers ----
         new_metadata = replace(attn_metadata, block_table=remapped_bt)
 
         # Temporarily swap the backend's kv_cache_dtype so super().forward
         # does not try FP8 descale logic.
         orig_dtype = self.kv_cache_dtype
         self.kv_cache_dtype = "auto"
-
-        # Fake a kv_cache from the decompressed tensors so that super().forward
-        # can unbind(0) it correctly.
-        if _PROFILE_PREFILL:
-            fake_kv_cache, stack_ms = _time_cuda_section(
-                lambda: torch.stack([decomp_key, decomp_value], dim=0)
-            )
-            result, flash_attn_ms = _time_cuda_section(
-                lambda: super(TurboQuantAttentionImpl, self).forward(
+        try:
+            if _PROFILE_PREFILL:
+                stack_ms = 0.0
+                result, flash_attn_ms = _time_cuda_section(
+                    lambda: super(TurboQuantAttentionImpl, self).forward(
+                        layer=layer,
+                        query=query_rot,
+                        key=key,
+                        value=value,
+                        kv_cache=dense_kv_cache,
+                        attn_metadata=new_metadata,
+                        output=output,
+                        output_scale=output_scale,
+                        output_block_scale=output_block_scale,
+                    )
+                )
+            else:
+                stack_ms = 0.0
+                result = super().forward(
                     layer=layer,
                     query=query_rot,
                     key=key,
                     value=value,
-                    kv_cache=fake_kv_cache,
+                    kv_cache=dense_kv_cache,
                     attn_metadata=new_metadata,
                     output=output,
                     output_scale=output_scale,
                     output_block_scale=output_block_scale,
                 )
-            )
-        else:
-            fake_kv_cache = torch.stack([decomp_key, decomp_value], dim=0)
-            stack_ms = 0.0
-            result = super().forward(
-                layer=layer,
-                query=query_rot,
-                key=key,
-                value=value,
-                kv_cache=fake_kv_cache,
-                attn_metadata=new_metadata,
-                output=output,
-                output_scale=output_scale,
-                output_block_scale=output_block_scale,
-            )
-            flash_attn_ms = 0.0
-
-        self.kv_cache_dtype = orig_dtype
+                flash_attn_ms = 0.0
+        finally:
+            self.kv_cache_dtype = orig_dtype
         if not self._value_output_folded:
             if _PROFILE_PREFILL:
                 rotated_out, inverse_rotate_ms = _time_cuda_section(
@@ -846,7 +925,7 @@ class TurboQuantAttentionImpl(FlashAttentionImpl):
             stack_ms=stack_ms,
             flash_attn_ms=flash_attn_ms,
             inverse_rotate_ms=inverse_rotate_ms,
-            num_unique_blocks=float(num_unique),
+            num_unique_blocks=float(num_blocks_dense),
         )
         _maybe_flush_prefill_timings()
         return result
@@ -873,7 +952,12 @@ class TurboQuantAttentionImpl(FlashAttentionImpl):
         block_table = attn_metadata.block_table[:num_actual]
 
         # query layout: [num_tokens, num_heads, head_size] — for decode num_tokens == num_seqs
-        result = turboquant_fused_paged_decode(
+        decode_impl = (
+            turboquant_minikv_fused_decode
+            if os.environ.get("TURBOQUANT_USE_MINIKV_ADAPTER", "0") == "1"
+            else turboquant_fused_paged_decode
+        )
+        result = decode_impl(
             query=query[:num_actual],
             key_cache=comp_key_cache,
             value_cache=comp_value_cache,
@@ -976,6 +1060,10 @@ class TurboQuantAttentionImpl(FlashAttentionImpl):
         seq_lens = attn_metadata.seq_lens[: query_lens.shape[0]]
         prefix_lens = seq_lens - query_lens
         block_table = attn_metadata.block_table[: query_lens.shape[0]]
+        prefix_score_ms_total = 0.0
+        prefix_value_ms_total = 0.0
+        local_score_ms_total = 0.0
+        local_value_ms_total = 0.0
 
         for req_idx, q_len_tensor in enumerate(query_lens.tolist()):
             q_len = int(q_len_tensor)
@@ -985,75 +1073,169 @@ class TurboQuantAttentionImpl(FlashAttentionImpl):
             q_chunk = query[start:stop]
             k_chunk = key[start:stop]
             v_chunk = value[start:stop]
+            local_key = k_chunk.repeat_interleave(q_per_kv, dim=1)
+            local_value = v_chunk.repeat_interleave(q_per_kv, dim=1)
+            local_key_f32 = local_key.to(torch.float32)
+            k_positions = torch.arange(
+                q_len,
+                device=query.device,
+                dtype=torch.int64,
+            )[None, :]
             prefix_len = int(prefix_lens[req_idx].item())
             num_prefix_blocks = (prefix_len + block_size - 1) // block_size
 
+            query_chunk_size = max(
+                1, int(os.environ.get("TURBOQUANT_QJL_PREFIX_QUERY_CHUNK", "64"))
+            )
+            # Local score tensor is dense [q_chunk, heads, q_len]; cap to avoid OOM.
+            query_chunk_size = min(query_chunk_size, 512)
+            req_out = query.new_zeros((q_len, self.num_heads, self._real_head_size))
             if prefix_len > 0 and num_prefix_blocks > 0:
                 comp_block_table = block_table[req_idx, :num_prefix_blocks].to(
                     device=query.device,
                     dtype=block_table.dtype,
                 )
-                packed_scores, value_pack, value_scale, value_min = packed_qjl_prefix_scores_multi_query(
-                    q_chunk,
-                    packed_cache=packed_cache,
-                    block_table=comp_block_table,
-                    seq_len=prefix_len,
-                    proj_dir_score=proj_dir_score,
-                    scale=self.scale,
-                    rotation=rotation,
-                    outlier_count=self._qjl_outlier_count,
-                    value_group_size=self._qjl_value_group_size,
-                    value_bits=self._qjl_value_bits,
-                )
-                prefix_scores = packed_scores.to(torch.float32)
-                prefix_value_pack = value_pack.unsqueeze(0)
-                prefix_value_scale = value_scale.unsqueeze(0)
-                prefix_value_min = value_min.unsqueeze(0)
+                prefix_value_pack = None
+                prefix_value_scale = None
+                prefix_value_min = None
+                have_prefix_values = False
             else:
-                prefix_scores = query.new_empty((q_len, self.num_heads, 0), dtype=torch.float32)
+                comp_block_table = None
                 prefix_value_pack = query.new_empty(
-                    (1, self.num_kv_heads, 0, self._real_head_size * self._qjl_value_bits // 32),
+                    (
+                        1,
+                        self.num_kv_heads,
+                        0,
+                        self._real_head_size * self._qjl_value_bits // 32,
+                    ),
                     dtype=torch.int32,
                 )
                 prefix_value_scale = query.new_empty(
-                    (1, self.num_kv_heads, 0, self._real_head_size // self._qjl_value_group_size)
+                    (
+                        1,
+                        self.num_kv_heads,
+                        0,
+                        self._real_head_size // self._qjl_value_group_size,
+                    )
                 )
                 prefix_value_min = torch.empty_like(prefix_value_scale)
+                have_prefix_values = True
 
-            local_key = k_chunk.repeat_interleave(q_per_kv, dim=1)
-            local_value = v_chunk.repeat_interleave(q_per_kv, dim=1)
-            local_scores = torch.einsum(
-                "qhd,khd->qhk",
-                q_chunk.to(torch.float32),
-                local_key.to(torch.float32),
-            ) * self.scale
-            causal_mask = torch.triu(
-                torch.ones(q_len, q_len, device=query.device, dtype=torch.bool),
-                diagonal=1,
-            )
-            local_scores = local_scores.masked_fill(causal_mask.unsqueeze(1), float("-inf"))
+            for q_start in range(0, q_len, query_chunk_size):
+                q_stop = min(q_start + query_chunk_size, q_len)
+                q_slice = q_chunk[q_start:q_stop]
 
-            all_scores = torch.cat([prefix_scores, local_scores], dim=-1)
-            all_weights = torch.softmax(all_scores, dim=-1, dtype=torch.float32).to(query.dtype)
+                if comp_block_table is not None:
+                    (packed_scores, value_pack, value_scale, value_min), prefix_score_ms = _time_cuda_section(
+                        lambda: packed_qjl_prefix_scores_multi_query(
+                            q_slice,
+                            packed_cache=packed_cache,
+                            block_table=comp_block_table,
+                            seq_len=prefix_len,
+                            proj_dir_score=proj_dir_score,
+                            scale=self.scale,
+                            rotation=rotation,
+                            outlier_count=self._qjl_outlier_count,
+                            value_group_size=self._qjl_value_group_size,
+                            value_bits=self._qjl_value_bits,
+                            gather_values=not have_prefix_values,
+                        )
+                    )
+                    prefix_score_ms_total += prefix_score_ms
+                    prefix_scores = packed_scores.to(torch.float32)
+                    if not have_prefix_values:
+                        assert value_pack is not None
+                        assert value_scale is not None
+                        assert value_min is not None
+                        prefix_value_pack = value_pack.unsqueeze(0)
+                        prefix_value_scale = value_scale.unsqueeze(0)
+                        prefix_value_min = value_min.unsqueeze(0)
+                        have_prefix_values = True
+                else:
+                    prefix_scores = query.new_empty(
+                        (q_stop - q_start, self.num_heads, 0), dtype=torch.float32
+                    )
 
-            req_out = query.new_zeros((q_len, self.num_heads, self._real_head_size))
-            prefix_tokens = prefix_scores.shape[-1]
+                use_triton_local = (
+                    os.environ.get("TURBOQUANT_QJL_LOCAL_TRITON", "0") == "1"
+                )
+                if use_triton_local:
+                    (local_out, local_lse), local_score_ms = _time_cuda_section(
+                        lambda: qjl_local_causal_attn_triton(
+                            q_slice,
+                            k_chunk,
+                            v_chunk,
+                            gqa_ratio=q_per_kv,
+                            scale=self.scale,
+                            q_start=q_start,
+                        )
+                    )
+                    local_score_ms_total += local_score_ms
+                else:
+                    (local_scores, local_lse, local_weights), local_score_ms = _time_cuda_section(
+                        lambda: _qjl_local_scores(
+                            q_slice,
+                            local_key_f32,
+                            self.scale,
+                            q_start,
+                            k_positions,
+                        )
+                    )
+                    local_score_ms_total += local_score_ms
+                    local_out, local_value_ms = _time_cuda_section(
+                        lambda: torch.einsum(
+                            "qhk,khd->qhd",
+                            local_weights,
+                            local_value,
+                        )
+                    )
+                    local_value_ms_total += local_value_ms
+                prefix_tokens = prefix_scores.shape[-1]
+                q_out = query.new_zeros(
+                    (q_stop - q_start, self.num_heads, self._real_head_size)
+                )
+                prefix_lse = local_lse.new_full(
+                    (q_stop - q_start, self.num_heads), float("-inf")
+                )
 
-            if prefix_tokens > 0:
-                req_out += cuda_quantized_bmm_gqa_dynamic(
-                    self._qjl_value_group_size,
-                    all_weights[:, :, :prefix_tokens].permute(1, 0, 2).unsqueeze(0),
-                    prefix_value_pack,
-                    prefix_value_scale,
-                    prefix_value_min,
-                    self._qjl_value_bits,
-                ).squeeze(0).permute(1, 0, 2)
+                if prefix_tokens > 0:
+                    assert prefix_value_pack is not None
+                    assert prefix_value_scale is not None
+                    assert prefix_value_min is not None
+                    prefix_lse = torch.logsumexp(prefix_scores, dim=-1)
+                    prefix_weights = torch.softmax(
+                        prefix_scores, dim=-1, dtype=torch.float32
+                    ).to(query.dtype)
+                    prefix_out, prefix_value_ms = _time_cuda_section(
+                        lambda: cuda_quantized_bmm_gqa_dynamic(
+                            self._qjl_value_group_size,
+                            prefix_weights.permute(1, 0, 2).unsqueeze(0),
+                            prefix_value_pack,
+                            prefix_value_scale,
+                            prefix_value_min,
+                            self._qjl_value_bits,
+                        )
+                    )
+                    prefix_value_ms_total += prefix_value_ms
+                    prefix_out = prefix_out.squeeze(0).permute(1, 0, 2)
+                    joint_lse = torch.logaddexp(prefix_lse, local_lse)
+                    prefix_scale = torch.exp(prefix_lse - joint_lse).to(query.dtype)
+                    local_scale = torch.exp(local_lse - joint_lse).to(query.dtype)
+                    q_out += prefix_out * prefix_scale.unsqueeze(-1)
+                    q_out += local_out * local_scale.unsqueeze(-1)
+                else:
+                    q_out += local_out
+                req_out[q_start:q_stop].copy_(q_out)
 
-            req_out += torch.einsum(
-                "qhk,khd->qhd",
-                all_weights[:, :, prefix_tokens:],
-                local_value,
-            )
             output[start:stop].copy_(req_out)
 
+        _record_prefill_timing(
+            calls=1.0,
+            qjl_prefix_calls=1.0,
+            qjl_prefix_score_ms=prefix_score_ms_total,
+            qjl_prefix_value_ms=prefix_value_ms_total,
+            qjl_local_score_ms=local_score_ms_total,
+            qjl_local_value_ms=local_value_ms_total,
+        )
+        _maybe_flush_prefill_timings()
         return output

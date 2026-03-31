@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from vllm.v1.attention.ops.triton_turboquant_kv import apply_rotation
 from vllm.v1.attention.ops.qjl_kernels import (
     make_qjl_projection,
+    qjl_score_stage12_multi_query_triton,
     qjl_score_stage12_triton,
     quantize_values_2bit,
 )
@@ -759,16 +760,31 @@ def packed_qjl_prefix_scores_multi_query(
     ).to(torch.uint8)
     q_hashes_packed = _pack_bits_lastdim(q_hashes)
     q_norms = torch.linalg.vector_norm(query_score.to(torch.float32), dim=-1)
-    scores = _score_stage12_multi_query(
-        query_score,
-        q_hashes_packed,
-        q_norms,
-        key_pack,
-        key_scale,
-        residual_hash_packed,
-        residual_norm,
-        sketch_dim=sketch_dim,
-    )
+    if query.is_cuda:
+        scores = qjl_score_stage12_multi_query_triton(
+            query_score,
+            q_hashes_packed,
+            q_norms,
+            key_pack,
+            key_scale,
+            residual_hash_packed,
+            residual_norm,
+            seq_len=seq_len,
+            gqa_ratio=q_heads // kv_heads,
+            scale=1.0,
+            sketch_dim=sketch_dim,
+        )
+    else:
+        scores = _score_stage12_multi_query(
+            query_score,
+            q_hashes_packed,
+            q_norms,
+            key_pack,
+            key_scale,
+            residual_hash_packed,
+            residual_norm,
+            sketch_dim=sketch_dim,
+        )
     scores = scores * scale
     valid = _get_arange(
         max_blocks * packed_cache.shape[2],

@@ -1,0 +1,20 @@
+{
+  "config": {
+    "model": "openai/gpt-oss-20b",
+    "kv_dtype": "turboquant_qjl",
+    "attention_backend": null,
+    "enforce_eager": true,
+    "no_chunked_prefill": true,
+    "output": "results/gpt-oss-20b_turboquant-qjl_baseline.json",
+    "max_model_len": 12288,
+    "gpu_util": 0.93,
+    "workloads": [
+      "ctx8k"
+    ],
+    "profile_turboquant_paths": false,
+    "cudagraph_mode": "auto"
+  },
+  "resolved_cudagraph_mode": "piecewise",
+  "results": [],
+  "profile": []
+}

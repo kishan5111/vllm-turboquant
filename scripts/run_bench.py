@@ -161,6 +161,10 @@ def _kv_bytes_per_token(kv_dtype: str) -> float:
     """Bytes per token per KV head pair for the given dtype."""
     HEAD_SIZE = 128
     NUM_KV_HEADS = 8
+    if kv_dtype == "turboquant_qjl":
+        # qjl_packed_slot_size(sketch_dim=head_size, outlier_count=0, head_size=128,
+        # value_group_size=32, value_bits=2) = 100 bytes per KV head.
+        return 100 * NUM_KV_HEADS
     if kv_dtype.startswith("turboquant"):
         return (HEAD_SIZE // 2 + 2) * 2 * NUM_KV_HEADS  # 66 * 2 * 8 = 1056
     elif kv_dtype.startswith("fp8"):
@@ -195,10 +199,21 @@ def _resolve_cudagraph_mode(requested_mode: str, kv_dtype: str) -> str:
     return "full_decode_only"
 
 
+def _kv_block_size(kv_dtype: str) -> int | None:
+    # TurboQuant stage1+2 packed cache expects 32-token cache blocks.
+    if kv_dtype == "turboquant_qjl":
+        return 32
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="openai/gpt-oss-20b")
-    parser.add_argument("--kv-dtype", default="fp8", choices=["fp8", "turboquant_4bit", "auto"])
+    parser.add_argument(
+        "--kv-dtype",
+        default="fp8",
+        choices=["fp8", "turboquant_4bit", "turboquant_qjl", "auto"],
+    )
     parser.add_argument("--attention-backend", default=None)
     parser.add_argument("--enforce-eager", action="store_true", default=False)
     parser.add_argument("--no-chunked-prefill", action="store_true", default=False)
@@ -249,7 +264,12 @@ def main():
         os.environ["VLLM_ATTENTION_BACKEND"] = args.attention_backend
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    llm = LLM(
+    enable_chunked_prefill = not args.no_chunked_prefill
+    if args.kv_dtype == "turboquant_qjl" and enable_chunked_prefill:
+        print("Forcing non-chunked prefill for turboquant_qjl (stability workaround).")
+        enable_chunked_prefill = False
+
+    llm_kwargs = dict(
         model=args.model,
         kv_cache_dtype=args.kv_dtype,
         max_model_len=args.max_model_len,
@@ -257,9 +277,14 @@ def main():
         disable_log_stats=False,
         enable_prefix_caching=False,
         enforce_eager=args.enforce_eager,
-        enable_chunked_prefill=not args.no_chunked_prefill,
+        enable_chunked_prefill=enable_chunked_prefill,
         compilation_config={"cudagraph_mode": resolved_cudagraph_mode},
     )
+    block_size = _kv_block_size(args.kv_dtype)
+    if block_size is not None:
+        llm_kwargs["block_size"] = block_size
+
+    llm = LLM(**llm_kwargs)
 
     results = []
     for wl_name in args.workloads:
