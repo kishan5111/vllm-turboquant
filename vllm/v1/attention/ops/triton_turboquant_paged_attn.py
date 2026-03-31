@@ -466,14 +466,20 @@ def turboquant_fused_paged_decode(
     write_direct     = (kv_splits == 1)
 
     # Next power-of-2 >= blocks_per_split (required by tl.arange in bt-prefetch).
-    # USE_BT_PREFETCH is only beneficial when BPS_POW2 ≤ 64: the mask-sum
-    # extraction inside the loop costs O(BPS × BPS_POW2) ops, which is
-    # negligible for small splits but adds more overhead than it saves
-    # when BPS > ~64 (large contexts / few splits).
+    # USE_BT_PREFETCH enables pipelining by pre-loading all block IDs upfront,
+    # breaking the dependent load chain:
+    #   bt[seq, blk] → bid → cache[bid, kv_head, ...]
+    # Without this, each iteration must wait for the previous bid load before
+    # computing the next cache address, preventing Triton from overlapping
+    # memory loads with compute.
+    #
+    # Threshold was 64, but at 65k context with 2 seqs, blocks_per_split=128
+    # which disabled pipelining when it's most needed. The mask-sum overhead
+    # of O(BPS × BPS_POW2) = 16K ops at BPS=128 is negligible vs memory latency.
     bps_pow2 = 1
     while bps_pow2 < blocks_per_split:
         bps_pow2 *= 2
-    use_bt_prefetch = (bps_pow2 <= 64)
+    use_bt_prefetch = (bps_pow2 <= 256)
 
     dtype = query.dtype
     rotation = rotation.to(dtype).contiguous()
