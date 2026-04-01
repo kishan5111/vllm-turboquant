@@ -213,11 +213,64 @@ def _compute_fused_attention(
     q_sketch_expanded = q_sketch.repeat_interleave(gqa_ratio, dim=0)
 
     if has_history and has_recent:
-        # Concatenate compressed history with exact recent
-        # This requires the fused kernel to handle both segments
-        # For simplicity, concatenate in PyTorch for now
-        k_all, v_all = _get_all_keys_values(flat, engine, num_kv_heads, head_dim)
-        return _matmul_attention(query, k_all, v_all, scale, gqa_ratio, num_kv_heads)
+        # Fused kernel handles both history (MSE+QJL) and recent (float32) in one pass.
+        # History tokens: dequantized inside kernel from packed MSE+QJL
+        # Recent tokens: float32 from ring buffer, processed with direct matmul
+        mse_packed = flat.prod_q.mse_indices
+        qjl_signs = flat.prod_q.qjl_signs
+        norms = flat.prod_q.norms
+        res_norms = flat.prod_q.residual_norms
+        value_q = flat.value_q
+
+        # Unpack values
+        v_data = _unpack_value_data(value_q)
+        v_scales = value_q.scales
+        v_zeros = value_q.zeros
+
+        # Reshape history for fused kernel: (T, H_kv, ...) -> (H_kv, T, ...)
+        # Use .reshape() to ensure contiguous layout
+        mse_packed = mse_packed.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1, packed_d)
+        qjl_signs = qjl_signs.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1, D//8)
+        norms = norms.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1)
+        res_norms = res_norms.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1)
+        v_data = v_data.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1, D)
+        v_scales = v_scales.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1, n_groups)
+        v_zeros = v_zeros.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1, n_groups)
+
+        # Recent tokens from ring buffer: (T_recent, H_kv, D) -> (H_kv, T_recent, D)
+        recent_k = recent[0].transpose(0, 1).contiguous()  # (H_kv, N_recent, D)
+        recent_v = recent[1].transpose(0, 1).contiguous()  # (H_kv, N_recent, D)
+
+        # Flatten query from (T, Q, D) to (BH, D) for kernel
+        query_flat = query.reshape(-1, D)  # (BH, D)
+
+        # Call fused kernel with both history and recent
+        result = turboquant_fused_decode(
+            query=query_flat,
+            quantized_key=flat.prod_q._replace(
+                mse_indices=mse_packed,
+                qjl_signs=qjl_signs,
+                norms=norms,
+                residual_norms=res_norms,
+            ),
+            value_quantized=value_q._replace(
+                data=v_data,
+                scales=v_scales,
+                zeros=v_zeros,
+            ),
+            Pi=Pi,
+            S=S,
+            centroids=centroids,
+            mse_bits=flat.prod_q.mse_bits,
+            qjl_scale=qjl_scale,
+            sm_scale=scale,
+            group_size=32,
+            gqa_ratio=gqa_ratio,
+            recent_k=recent_k,
+            recent_v=recent_v,
+        )
+
+        return result.view(T, -1, D)
 
     elif has_history:
         # History only - use fused Triton kernel (skip dequantization)
@@ -245,16 +298,15 @@ def _compute_fused_attention(
         BH = num_kv_heads * gqa_ratio  # T=1 so T*H_kv = H_kv
 
         # MSE/QJL: squeeze T dim then add back as 1 for uniform (H_kv, 1, ...) shape
-        mse_packed = mse_packed.squeeze(1)  # (H_kv, packed_d)
-        mse_packed = mse_packed.unsqueeze(1)  # (H_kv, 1, packed_d)
-        qjl_signs = qjl_signs.squeeze(1).unsqueeze(1)  # (H_kv, 1, D//8)
-        norms = norms.squeeze(1).unsqueeze(1)  # (H_kv, 1)
-        res_norms = res_norms.squeeze(1).unsqueeze(1)  # (H_kv, 1)
+        mse_packed = mse_packed.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1, packed_d)
+        qjl_signs = qjl_signs.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1, D//8)
+        norms = norms.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1)
+        res_norms = res_norms.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1)
 
         # Values: (T, H_kv, D) -> (H_kv, 1, D)
-        v_data = v_data.squeeze(1).unsqueeze(1)  # (H_kv, 1, D)
-        v_scales = v_scales.squeeze(1).unsqueeze(1)  # (H_kv, 1, n_groups)
-        v_zeros = v_zeros.squeeze(1).unsqueeze(1)  # (H_kv, 1, n_groups)
+        v_data = v_data.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1, D)
+        v_scales = v_scales.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1, n_groups)
+        v_zeros = v_zeros.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1, n_groups)
 
         # Flatten query from (T, Q, D) to (BH, D) for kernel
         query_flat = query.reshape(-1, D)  # (BH, D)
@@ -346,7 +398,7 @@ def _matmul_attention(
     gqa_ratio: int,
     num_kv_heads: int,
 ) -> torch.Tensor:
-    """Standard GQA matmul attention using einsum (from 0xSero).
+    """Standard GQA matmul attention using scaled dot product (FlashAttention-style).
 
     query: (T, Q, D) where Q = num_kv_heads * gqa_ratio
     kv_keys: (num_kv_heads, N, D)
@@ -360,20 +412,19 @@ def _matmul_attention(
     if Q != H_kv * G:
         raise ValueError(f"Incompatible GQA shapes: Q={Q}, H_kv={H_kv}, gqa_ratio={G}")
 
-    # q: (T, Q, D) -> (H_kv, G, T, D)
-    q = query.float().view(T, H_kv, G, D).permute(1, 2, 0, 3)
-    # k: (H_kv, N, D) -> (H_kv, 1, N, D) broadcast over G
-    k = kv_keys.float().unsqueeze(1)
-    v = kv_values.float().unsqueeze(1)
+    # Reshape for GQA: (T, Q, D) -> (T, H_kv, G, D)
+    q = query.float().view(T, H_kv, G, D)
+    # kv_keys/values: (H_kv, N, D) -> (T, H_kv, N, D) broadcast over T
+    k = kv_keys.float().unsqueeze(0)   # (1, H_kv, N, D)
+    v = kv_values.float().unsqueeze(0)  # (1, H_kv, N, D)
 
-    # scores: (H_kv, G, T, N)
-    scores = torch.einsum("hgtd,hgnd->hgtn", q, k) * scale
-    weights = F.softmax(scores, dim=-1)
-    # out: (H_kv, G, T, D)
-    out = torch.einsum("hgtn,hgnd->hgtd", weights, v)
-
-    # Back to (T, Q, D)
-    return out.permute(2, 0, 1, 3).reshape(T, Q, D).to(query.dtype)
+    # F.scaled_dot_product_attention uses FlashAttention internally
+    # It expects: q=(T,H,D,N), k=(T,H,D,N), v=(T,H,D,N) — flash attention style
+    # But it also supports: q=(T,H,G,D), kv=(T,H,D,N) with GQA via is_broadcastable
+    # Use permute to get (T, H_kv, G, D) for q and (T, H_kv, N, D) for k,v
+    out = F.scaled_dot_product_attention(q, k, v, scale=scale)
+    # out: (T, H_kv, G, D) -> (T, Q, D)
+    return out.reshape(T, Q, D).to(query.dtype)
 
 
 # ---------------------------------------------------------------------------

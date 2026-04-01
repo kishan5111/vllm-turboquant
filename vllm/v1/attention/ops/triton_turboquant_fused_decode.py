@@ -198,6 +198,9 @@ def _turboquant_fused_decode_kernel(
     V_DATA_ptr,      # (BH, N, D) uint8 quantized values
     V_SCALES_ptr,    # (BH, N, n_groups) value scales
     V_ZEROS_ptr,     # (BH, N, n_groups) value zeros
+    # Recent tokens (float32, exact from ring buffer)
+    RECENT_K_ptr,    # (BH, N_recent, D) float32 keys
+    RECENT_V_ptr,    # (BH, N_recent, D) float32 values
     # Output
     OUT_ptr,         # (BH, D) output
     # Strides
@@ -209,9 +212,12 @@ def _turboquant_fused_decode_kernel(
     stride_v_bh, stride_v_n, stride_v_d,
     stride_vs_bh, stride_vs_n, stride_vs_g,
     stride_vz_bh, stride_vz_n, stride_vz_g,
+    stride_rk_bh, stride_rk_n, stride_rk_d,
+    stride_rv_bh, stride_rv_n, stride_rv_d,
     stride_o_bh, stride_o_d,
     # Dims
     N,
+    N_recent,
     D: tl.constexpr,
     PACKED_D_MSE: tl.constexpr,
     PACKED_D_SIGNS: tl.constexpr,
@@ -232,93 +238,145 @@ def _turboquant_fused_decode_kernel(
     l_i = tl.zeros([1], dtype=tl.float32)
     acc = tl.zeros([D], dtype=tl.float32)
 
-    num_blocks = tl.cdiv(N, BLOCK_N)
+    # Total tokens = history (N) + recent (N_recent)
+    N_total = N + N_recent
+    num_blocks_hist = tl.cdiv(N, BLOCK_N)
+    num_blocks_recent = tl.cdiv(N_recent, BLOCK_N) if N_recent > 0 else 0
+    total_blocks = num_blocks_hist + num_blocks_recent
 
-    for block_idx in range(num_blocks):
+    for block_idx in range(total_blocks):
         n_start = block_idx * BLOCK_N
         n_offs = n_start + tl.arange(0, BLOCK_N)
-        n_mask = n_offs < N
 
-        # Part 1: MSE score
-        mse_scores = tl.zeros([BLOCK_N], dtype=tl.float32)
-        for byte_idx in range(PACKED_D_MSE):
-            packed = tl.load(
-                MSE_ptr + pid_bh * stride_m_bh + n_offs * stride_m_n + byte_idx * stride_m_d,
-                mask=n_mask, other=0
-            ).to(tl.int32)
-            for sub in range(VALS_PER_BYTE):
-                coord_idx = byte_idx * VALS_PER_BYTE + sub
-                if coord_idx < D:
-                    idx = (packed >> (sub * BITS)) & BIT_MASK
-                    centroid_val = tl.load(CENTROIDS_ptr + idx)
-                    q_val = tl.load(Q_ROT_ptr + pid_bh * stride_q_bh + coord_idx * stride_q_d).to(tl.float32)
-                    mse_scores += q_val * centroid_val
+        # Determine if this is a history block or recent block
+        is_history = block_idx < num_blocks_hist
 
-        key_norms = tl.load(
-            NORMS_ptr + pid_bh * stride_n_bh + n_offs * stride_n_n,
-            mask=n_mask, other=0.0
-        ).to(tl.float32)
-        mse_scores = mse_scores * key_norms
+        if is_history:
+            # ---- History block: MSE+QJL dequantization ----
+            n_mask = n_offs < N
+            n_offs_hist = n_offs  # 0-based within history
 
-        # Part 2: QJL score
-        qjl_dot = tl.zeros([BLOCK_N], dtype=tl.float32)
-        for byte_idx in range(PACKED_D_SIGNS):
-            packed = tl.load(
-                SIGNS_ptr + pid_bh * stride_s_bh + n_offs * stride_s_n + byte_idx * stride_s_d,
-                mask=n_mask, other=0
-            ).to(tl.int32)
-            for bit in range(8):
-                coord_idx = byte_idx * 8 + bit
-                if coord_idx < D:
-                    sign_bit = (packed >> bit) & 1
-                    sign_val = tl.where(sign_bit == 1, 1.0, -1.0)
-                    q_val = tl.load(Q_SKETCH_ptr + pid_bh * stride_q_bh + coord_idx * stride_q_d).to(tl.float32)
-                    qjl_dot += q_val * sign_val
+            # MSE score
+            mse_scores = tl.zeros([BLOCK_N], dtype=tl.float32)
+            for byte_idx in range(PACKED_D_MSE):
+                packed = tl.load(
+                    MSE_ptr + pid_bh * stride_m_bh + n_offs_hist * stride_m_n + byte_idx * stride_m_d,
+                    mask=n_mask, other=0
+                ).to(tl.int32)
+                for sub in range(VALS_PER_BYTE):
+                    coord_idx = byte_idx * VALS_PER_BYTE + sub
+                    if coord_idx < D:
+                        idx = (packed >> (sub * BITS)) & BIT_MASK
+                        centroid_val = tl.load(CENTROIDS_ptr + idx)
+                        q_val = tl.load(Q_ROT_ptr + pid_bh * stride_q_bh + coord_idx * stride_q_d).to(tl.float32)
+                        mse_scores += q_val * centroid_val
 
-        res_norms = tl.load(
-            RES_NORMS_ptr + pid_bh * stride_rn_bh + n_offs * stride_rn_n,
-            mask=n_mask, other=0.0
-        ).to(tl.float32)
-        qjl_scores = qjl_dot * res_norms * QJL_SCALE
+            key_norms = tl.load(
+                NORMS_ptr + pid_bh * stride_n_bh + n_offs_hist * stride_n_n,
+                mask=n_mask, other=0.0
+            ).to(tl.float32)
+            mse_scores = mse_scores * key_norms
 
-        # Combined score
-        scores = (mse_scores + qjl_scores) * SM_SCALE
-        scores = tl.where(n_mask, scores, float("-inf"))
+            # QJL score
+            qjl_dot = tl.zeros([BLOCK_N], dtype=tl.float32)
+            for byte_idx in range(PACKED_D_SIGNS):
+                packed = tl.load(
+                    SIGNS_ptr + pid_bh * stride_s_bh + n_offs_hist * stride_s_n + byte_idx * stride_s_d,
+                    mask=n_mask, other=0
+                ).to(tl.int32)
+                for bit in range(8):
+                    coord_idx = byte_idx * 8 + bit
+                    if coord_idx < D:
+                        sign_bit = (packed >> bit) & 1
+                        sign_val = tl.where(sign_bit == 1, 1.0, -1.0)
+                        q_val = tl.load(Q_SKETCH_ptr + pid_bh * stride_q_bh + coord_idx * stride_q_d).to(tl.float32)
+                        qjl_dot += q_val * sign_val
 
-        # Online softmax update
-        m_new = tl.maximum(m_i, tl.max(scores, 0))
-        alpha = tl.exp(m_i - m_new)
-        p = tl.exp(scores - m_new)
+            res_norms = tl.load(
+                RES_NORMS_ptr + pid_bh * stride_rn_bh + n_offs_hist * stride_rn_n,
+                mask=n_mask, other=0.0
+            ).to(tl.float32)
+            qjl_scores = qjl_dot * res_norms * QJL_SCALE
 
-        l_i = l_i * alpha + tl.sum(p, 0)
-        acc = acc * alpha
+            # Combined score
+            scores = (mse_scores + qjl_scores) * SM_SCALE
+            scores = tl.where(n_mask, scores, float("-inf"))
 
-        # Dequantize values for this block and accumulate
-        d_offs = tl.arange(0, D)
-        v_quant = tl.load(
-            V_DATA_ptr + pid_bh * stride_v_bh
-            + n_offs[:, None] * stride_v_n + d_offs[None, :] * stride_v_d,
-            mask=n_mask[:, None], other=0
-        ).to(tl.float32)
+            # Online softmax update
+            m_new = tl.maximum(m_i, tl.max(scores, 0))
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(scores - m_new)
 
-        # Value scales: group index = d_offs // GROUP_SIZE
-        g_offs = d_offs // GROUP_SIZE
-        v_scale = tl.load(
-            V_SCALES_ptr + pid_bh * stride_vs_bh
-            + n_offs[:, None] * stride_vs_n + g_offs[None, :] * stride_vs_g,
-            mask=n_mask[:, None], other=1.0
-        ).to(tl.float32)
-        v_zero = tl.load(
-            V_ZEROS_ptr + pid_bh * stride_vz_bh
-            + n_offs[:, None] * stride_vz_n + g_offs[None, :] * stride_vz_g,
-            mask=n_mask[:, None], other=0.0
-        ).to(tl.float32)
+            l_i = l_i * alpha + tl.sum(p, 0)
+            acc = acc * alpha
 
-        # Dequantize and accumulate
-        v_dequant = v_quant * v_scale + v_zero
-        acc += tl.sum(p[:, None] * v_dequant, 0)
+            # Dequantize values for this block and accumulate
+            d_offs = tl.arange(0, D)
+            v_quant = tl.load(
+                V_DATA_ptr + pid_bh * stride_v_bh
+                + n_offs_hist[:, None] * stride_v_n + d_offs[None, :] * stride_v_d,
+                mask=n_mask[:, None], other=0
+            ).to(tl.float32)
 
-        m_i = m_new
+            g_offs = d_offs // GROUP_SIZE
+            v_scale = tl.load(
+                V_SCALES_ptr + pid_bh * stride_vs_bh
+                + n_offs_hist[:, None] * stride_vs_n + g_offs[None, :] * stride_vs_g,
+                mask=n_mask[:, None], other=1.0
+            ).to(tl.float32)
+            v_zero = tl.load(
+                V_ZEROS_ptr + pid_bh * stride_vz_bh
+                + n_offs_hist[:, None] * stride_vz_n + g_offs[None, :] * stride_vz_g,
+                mask=n_mask[:, None], other=0.0
+            ).to(tl.float32)
+
+            v_dequant = v_quant * v_scale + v_zero
+            acc += tl.sum(p[:, None] * v_dequant, 0)
+
+            m_i = m_new
+
+        else:
+            # ---- Recent block: float32 matmul (no dequantization) ----
+            recent_block_idx = block_idx - num_blocks_hist
+            n_start_recent = recent_block_idx * BLOCK_N
+            n_offs_recent = n_start_recent + tl.arange(0, BLOCK_N)
+            n_mask = n_offs_recent < N_recent
+
+            # Float32 QK^T for recent tokens
+            d_offs = tl.arange(0, D)
+            q_vals = tl.load(
+                Q_ROT_ptr + pid_bh * stride_q_bh + d_offs * stride_q_d,
+            ).to(tl.float32)  # (D,)
+
+            recent_scores = tl.zeros([BLOCK_N], dtype=tl.float32)
+            for d_idx in range(D):
+                k_val = tl.load(
+                    RECENT_K_ptr + pid_bh * stride_rk_bh
+                    + n_offs_recent * stride_rk_n + d_idx * stride_rk_d,
+                    mask=n_mask, other=0.0
+                ).to(tl.float32)
+                recent_scores += q_vals[d_idx] * k_val
+
+            recent_scores = recent_scores * SM_SCALE
+
+            # Online softmax update (continuing from history state)
+            m_new = tl.maximum(m_i, tl.max(recent_scores, 0))
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(recent_scores - m_new)
+
+            l_i = l_i * alpha + tl.sum(p, 0)
+            acc = acc * alpha
+
+            # Accumulate recent values
+            v_vals = tl.load(
+                RECENT_V_ptr + pid_bh * stride_rv_bh
+                + n_offs_recent * stride_rv_n + d_offs[None, :] * stride_rv_d,
+                mask=n_mask[:, None], other=0.0
+            ).to(tl.float32)
+
+            acc += tl.sum(p[:, None] * v_vals, 0)
+
+            m_i = m_new
 
     # Final normalization
     acc = acc / l_i
@@ -430,10 +488,16 @@ def turboquant_fused_decode(
     sm_scale: float,
     group_size: int = 32,
     gqa_ratio: int = 1,               # GQA ratio (H_q // H_kv)
+    recent_k: torch.Tensor = None,     # (BH, N_recent, D) float32 keys from ring buffer
+    recent_v: torch.Tensor = None,     # (BH, N_recent, D) float32 values from ring buffer
 ) -> torch.Tensor:
     """
     Fully fused decode attention: scores + softmax + value aggregation.
-    Single pass over compressed KV, flash-attention style online softmax.
+    Single pass over compressed KV (MSE+QJL) + recent (float32), flash-attention style.
+
+    Supports two-segment attention:
+    - History segment: packed MSE+QJL format (dequantized inside kernel)
+    - Recent segment: float32 from ring buffer (direct matmul)
 
     For GQA (gqa_ratio > 1):
       - KV tensors are (H_kv, N, ...) but kernel expects (BH, N, ...)
@@ -515,18 +579,35 @@ def turboquant_fused_decode(
         v_scales = v_scales.repeat_interleave(gqa_ratio, dim=0).contiguous()
         v_zeros = v_zeros.repeat_interleave(gqa_ratio, dim=0).contiguous()
 
+    # ----- Handle recent tokens (float32 from ring buffer) -----
+    N_recent = 0
+    if recent_k is not None and recent_v is not None:
+        recent_k = recent_k.contiguous()
+        recent_v = recent_v.contiguous()
+        N_recent = recent_k.shape[1]
+        if gqa_ratio > 1:
+            # Expand recent KV for GQA: (H_kv, N_recent, D) -> (BH=H_kv*G, N_recent, D)
+            recent_k = recent_k.repeat_interleave(gqa_ratio, dim=0).contiguous()
+            recent_v = recent_v.repeat_interleave(gqa_ratio, dim=0).contiguous()
+
     N_GROUPS = D // group_size
     eff_bits, vals_per_byte = _get_packing_params(mse_bits)
 
     out = torch.zeros(BH, D, device=query.device, dtype=torch.float32)
 
-    BLOCK_N = min(64, triton.next_power_of_2(N))
+    BLOCK_N = min(64, triton.next_power_of_2(max(N + N_recent, 1)))
     grid = (BH,)
+
+    # Prepare recent strides (even when None to keep kernel call valid)
+    stride_rk = (recent_k.stride(0), recent_k.stride(1), recent_k.stride(2)) if N_recent > 0 else (0, 0, 0)
+    stride_rv = (recent_v.stride(0), recent_v.stride(1), recent_v.stride(2)) if N_recent > 0 else (0, 0, 0)
 
     _turboquant_fused_decode_kernel[grid](
         q_rot, q_sketch,
         mse_packed, qjl_signs, norms, res_norms, centroids,
         v_data, v_scales, v_zeros,
+        recent_k if N_recent > 0 else torch.zeros(1, 1, D, device=query.device, dtype=torch.float32),
+        recent_v if N_recent > 0 else torch.zeros(1, 1, D, device=query.device, dtype=torch.float32),
         out,
         # Q strides
         q_rot.stride(0), q_rot.stride(1),
@@ -542,10 +623,13 @@ def turboquant_fused_decode(
         v_data.stride(0), v_data.stride(1), v_data.stride(2),
         v_scales.stride(0), v_scales.stride(1), v_scales.stride(2),
         v_zeros.stride(0), v_zeros.stride(1), v_zeros.stride(2),
+        # Recent strides
+        stride_rk[0], stride_rk[1], stride_rk[2],
+        stride_rv[0], stride_rv[1], stride_rv[2],
         # Out strides
         out.stride(0), out.stride(1),
         # Dims
-        N=N, D=D, PACKED_D_MSE=packed_d_mse, PACKED_D_SIGNS=packed_d_signs,
+        N=N, N_recent=N_recent, D=D, PACKED_D_MSE=packed_d_mse, PACKED_D_SIGNS=packed_d_signs,
         N_GROUPS=N_GROUPS, GROUP_SIZE=group_size,
         # Quant params
         BITS=eff_bits, VALS_PER_BYTE=vals_per_byte,
