@@ -30,6 +30,8 @@ packed `prod_q` data.
 
 ## Benchmark Results
 
+### Single-Request Throughput (GPT-OSS 20B)
+
 **Model**: GPT-OSS 20B (64 Q-heads, 8 KV-heads, GQA ratio=8)
 **Setup**: 8 prompts, 128 max_tokens, chunked prefill
 
@@ -38,14 +40,28 @@ packed `prod_q` data.
 | BF16 KV | eager + FlashAttn | ~207 tok/s | baseline |
 | FP8 KV | eager + FlashAttn | ~186 tok/s | 10% slower than bf16 |
 | FP8 KV | cudagraph + FlashInfer | **~1258 tok/s** | 6× from graph capture |
-| TurboQuant (3K/2V) | cudagraph + PyT fallback | **~1205 tok/s** | ~4% behind FP8 |
+| TurboQuant (3K/2V) | cudagraph + Triton kernel | **~1211 tok/s** | ~4% behind FP8 |
 | TurboQuant (3K/2V) | eager + PyT fallback | ~189 tok/s | same as eager FP8 |
 
+### Concurrency Benchmark (GPT-OSS 20B, max_model_len=65536)
+
+**Setup**: gpu_memory_utilization=0.90, 64-512 concurrent requests
+
+| Concurrency | FP8 tok/s | TurboQuant tok/s | Winner |
+|-------------|-----------|------------------|--------|
+| 8 | 819.7 | 654.9 | FP8 |
+| 16 | 1701.0 | 1348.1 | FP8 |
+| 32 | 2466.5 | 2469.4 | ~Tie |
+| 64 | 4581.2 | 4373.8 | FP8 |
+| 128 | 7167.1 | 6478.5 | FP8 |
+| 256 | 10040.1 | 7068.6 | **FP8 (+30%)** |
+| 512 | 8608.4 | 8696.8 | **TurboQuant!** |
+
 **Key findings**:
-- TQ + cudagraph = **~1205 tok/s** vs FP8 + cudagraph = **~1258 tok/s**
-- Gap is **~4%** — TQ uses PyTorch `_matmul_attention` fallback; FP8 uses FlashInfer
-- TQ fused kernel (Triton) is wired but only used in "history only" decode (ring buffer empty) — rare during cudagraph warmup
-- During cudagraph replay, the "history+recent" path always taken → PyTorch fallback
+- At low concurrency (8-64), FP8 maintains 5-21% throughput advantage
+- At very high concurrency (512), TurboQuant slightly edges out FP8
+- At 256 concurrency (AIMO3 batch_size), FP8 is **30% faster**
+- Root cause: FlashInfer's CUDA kernels are far more optimized than Triton's fused kernel
 - Output quality verified identical to baseline
 
 ## Bug Fixes Applied (2026-04-01)
@@ -57,14 +73,6 @@ GPT-OSS has 64 query heads and 8 KV heads. Code was reading `num_query_heads=8`
 from `attn_module.num_heads` (wrapper) instead of `impl.num_heads`
 (FlashAttentionImpl which has the correct 64).
 
-```python
-# Before: read from wrapper
-num_query_heads = getattr(attn_module, "num_heads", None)
-
-# After: read from impl
-num_query_heads = getattr(impl, "num_heads", None)
-```
-
 ### 2. Missing Transpose in "Recent Only" Branch
 **File**: `vllm/v1/attention/backends/turboquant_fused_backend.py` (line ~252)
 
@@ -72,29 +80,32 @@ Ring buffer stores `(T, H_kv, D)` but `_matmul_attention` expects `(H_kv, T, D)`
 The transpose was applied in the "history+recent" path via `_get_all_keys_values`
 but NOT in the "recent only" branch.
 
-```python
-# Before: recent_k passed without transpose
-return _matmul_attention(query, recent_k, recent_v, ...)
-
-# After: transpose to (H_kv, T, D)
-recent_k = recent[0].transpose(0, 1)
-recent_v = recent[1].transpose(0, 1)
-return _matmul_attention(query, recent_k, recent_v, ...)
-```
-
 ### 3. `torch.tensor()` Breaks CUDA Graph Capture
 **File**: `vllm/v1/attention/ops/turboquant_fused/quantizer.py` (lines ~220, ~228)
 
 `_pack_qjl_signs` and `_unpack_qjl_signs` created `torch.tensor([1,2,4,8,...])`
 on CUDA during capture. This caused `cudaErrorStreamCaptureUnsupported`.
 
-```python
-# Before: per-call tensor allocation (breaks cudagraph)
-powers = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], device=x.device, dtype=torch.uint8)
+### 4. Critical: `squeeze(1).unsqueeze(1)` Corrupting Tensor Shapes
+**File**: `vllm/v1/attention/backends/turboquant_fused_backend.py`
 
-# After: pre-allocated buffer registered in __init__
-self.register_buffer("_powers", torch.tensor([1,2,4,8,16,32,64,128], device=self.device, dtype=torch.uint8))
+The pattern `mse_packed.squeeze(1).unsqueeze(1).contiguous()` on shape `(T=1, H_kv=8, packed_d)`:
+- `squeeze(1)` removes dim 1 (size 8!) giving `(T=1, packed_d)` — **H_kv dimension lost!**
+- `unsqueeze(1)` adds it back as `(T=1, 1, packed_d)` — **garbage data**
+- `repeat_interleave(G, dim=0)` on garbage produces garbage
+
+**Fix:**
+```python
+# Before (BROKEN):
+mse_packed = mse_packed.squeeze(1).unsqueeze(1).contiguous()
+
+# After (CORRECT):
+mse_packed = mse_packed.reshape(H_kv, T, -1).contiguous()  # for history+recent
+# or
+mse_packed = mse_packed.permute(1, 0, 2).contiguous()  # for history only
 ```
+
+**Commit**: `d6587138d` — fix: correct tensor reshape in TurboQuant fused attention backend
 
 ## How to Run
 
@@ -102,11 +113,14 @@ self.register_buffer("_powers", torch.tensor([1,2,4,8,16,32,64,128], device=self
 # Integration test
 HF_HOME=/workspace/.hf_home .venv/bin/python tests/v1/test_turboquant_fused.py
 
-# Benchmark cudagraph modes
-HF_HOME=/workspace/.hf_home .venv/bin/python benchmarks/benchmark_turboquant_fused.py
+# Benchmark cudagraph modes (FP8 vs TQ comparison)
+HF_HOME=/workspace/.hf_home .venv/bin/python benchmarks/benchmark_turboquant_fused_cudagraph.py
 
-# Benchmark eager modes (baseline comparison)
-HF_HOME=/workspace/.hf_home .venv/bin/python benchmarks/benchmark_turboquant_fused_eager.py
+# Concurrency benchmark (256/512 concurrent requests)
+HF_HOME=/workspace/.hf_home .venv/bin/python benchmarks/benchmark_max_concurrency.py
+
+# Profile kernel bottlenecks
+HF_HOME=/workspace/.hf_home .venv/bin/python benchmarks/profile_kernel.py
 ```
 
 ## Key Files
@@ -124,21 +138,19 @@ HF_HOME=/workspace/.hf_home .venv/bin/python benchmarks/benchmark_turboquant_fus
 - ✅ CUDA graph compatibility (cudagraph capture succeeds)
 - ✅ Output quality matches baseline (verified with identical outputs)
 - ✅ Eager mode throughput comparable to FP8 eager
+- ✅ Triton fused kernel with history+recent support
+- ✅ Autotuning configured for BLOCK_N parameter
+- ✅ SDPA optimization in PyTorch fallback path
 
 ## What's NOT Working Yet
 
-- ❌ **Triton fused kernels in common path** — fused kernel is wired for "history only" case
-  but during cudagraph warmup the ring buffer always has recent tokens → "history+recent"
-  path is always taken → uses PyTorch `_matmul_attention` fallback
-  - Kernel GQA support is implemented (repeat_interleave expansion)
-  - Would need "history+recent" kernel extension to close the ~4% gap
-- ❌ **FlashInfer integration** — FlashInfer is used for FP8 KV baseline; TQ doesn't use it
-- ❌ **0 flash layers detected** — `LayerConfig.backend_kind` not set, so `install_hooks`
-  doesn't count any "flash layers"
+- ❌ **FlashInfer-level CUDA kernel** — Triton's fused kernel is ~4% slower than FlashInfer
+- ❌ **0 flash layers detected** — `LayerConfig.backend_kind` not set
 
-## Next Steps to Beat FP8 KV (~1263 tok/s → higher)
+## Next Steps
 
-1. **Extend Triton kernels for GQA** — current kernels assume MHA; need GQA-aware version
-2. **Wire Triton kernels as compute path** — replace `_matmul_attention` fallback with fused kernel
-3. **Skip dequantization** — compute scores from packed `prod_q` directly, saving memory bandwidth
-4. **Verify with FlashInfer** — FlashInfer used for FP8 KV; TQ needs its own FlashInfer-style kernel
+1. **Benchmark GPT-OSS 120B** — test FP8 vs TQ at high concurrency (256 workers)
+   - 120B has 6x higher KV cache pressure than 20B
+   - TQ's denser KV might outperform FP8 on the larger model
+2. **CUDA kernel** — attempt FlashInfer-style kernel if 120B shows TQ advantage
+3. **For AIMO3 with 120B**: Test both FP8 and TQ at batch_size=256, compare throughput
