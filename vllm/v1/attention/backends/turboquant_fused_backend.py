@@ -228,14 +228,14 @@ def _compute_fused_attention(
         v_zeros = value_q.zeros
 
         # Reshape history for fused kernel: (T, H_kv, ...) -> (H_kv, T, ...)
-        # Use .reshape() to ensure contiguous layout
-        mse_packed = mse_packed.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1, packed_d)
-        qjl_signs = qjl_signs.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1, D//8)
-        norms = norms.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1)
-        res_norms = res_norms.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1)
-        v_data = v_data.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1, D)
-        v_scales = v_scales.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1, n_groups)
-        v_zeros = v_zeros.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1, n_groups)
+        # For T=1: reshape to (H_kv, 1, ...) preserving the sequence dim
+        mse_packed = mse_packed.reshape(H_kv, T, -1).contiguous()  # (H_kv, T, packed_d)
+        qjl_signs = qjl_signs.reshape(H_kv, T, -1).contiguous()    # (H_kv, T, D//8)
+        norms = norms.reshape(H_kv, T).contiguous()                 # (H_kv, T)
+        res_norms = res_norms.reshape(H_kv, T).contiguous()         # (H_kv, T)
+        v_data = v_data.reshape(H_kv, T, -1).contiguous()          # (H_kv, T, D)
+        v_scales = v_scales.reshape(H_kv, T, -1).contiguous()     # (H_kv, T, n_groups)
+        v_zeros = v_zeros.reshape(H_kv, T, -1).contiguous()        # (H_kv, T, n_groups)
 
         # Recent tokens from ring buffer: (T_recent, H_kv, D) -> (H_kv, T_recent, D)
         recent_k = recent[0].transpose(0, 1).contiguous()  # (H_kv, N_recent, D)
@@ -274,39 +274,32 @@ def _compute_fused_attention(
 
     elif has_history:
         # History only - use fused Triton kernel (skip dequantization)
-        # The kernel expects KV tensors in (BH=H_kv*G, N=H_kv*T, ...) layout.
-        # For decode (T=1): MSE/QJL -> (H_kv, 1, packed_d), values -> (H_kv, 1, D)
-        mse_packed = flat.prod_q.mse_indices
-        qjl_signs = flat.prod_q.qjl_signs
-        norms = flat.prod_q.norms
-        res_norms = flat.prod_q.residual_norms
+        # Kernel expects KV in (BH=H_kv*G, N=H_kv*T, ...) layout.
+        # For decode (T=1): tensors (T=1, H_kv, ...) -> permute -> (H_kv, T=1, ...)
+        mse_packed = flat.prod_q.mse_indices          # (T, H_kv, packed_d)
+        qjl_signs = flat.prod_q.qjl_signs            # (T, H_kv, D//8)
+        norms = flat.prod_q.norms                    # (T, H_kv)
+        res_norms = flat.prod_q.residual_norms        # (T, H_kv)
         value_q = flat.value_q
 
         # Unpack values
-        v_data = _unpack_value_data(value_q)
-        v_scales = value_q.scales
-        v_zeros = value_q.zeros
+        v_data = _unpack_value_data(value_q)          # (T, H_kv, D)
+        v_scales = value_q.scales                      # (T, H_kv, n_groups)
+        v_zeros = value_q.zeros                        # (T, H_kv, n_groups)
 
-        # Reshape for fused kernel:
-        # mse_packed: (T, H_kv, packed_d) -> squeeze T -> (H_kv, T, packed_d)
-        # For T=1: squeeze removes dim 0 (size 1), giving (H_kv, packed_d)
-        # We need to add back the T dim for consistency: reshape to (H_kv, 1, packed_d)
-        # qjl_signs: (T, H_kv, D//8) -> (H_kv, 1, D//8)
-        # norms/res_norms: (T, H_kv) -> squeeze -> (H_kv,) -> unsqueeze -> (H_kv, 1)
-        # v_data: (T, H_kv, D) -> (H_kv, 1, D)
-        # v_scales/v_zeros: (T, H_kv, n_groups) -> (H_kv, 1, n_groups)
-        BH = num_kv_heads * gqa_ratio  # T=1 so T*H_kv = H_kv
-
-        # MSE/QJL: squeeze T dim then add back as 1 for uniform (H_kv, 1, ...) shape
-        mse_packed = mse_packed.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1, packed_d)
-        qjl_signs = qjl_signs.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1, D//8)
-        norms = norms.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1)
-        res_norms = res_norms.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1)
-
-        # Values: (T, H_kv, D) -> (H_kv, 1, D)
-        v_data = v_data.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1, D)
-        v_scales = v_scales.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1, n_groups)
-        v_zeros = v_zeros.squeeze(1).unsqueeze(1).contiguous()  # (H_kv, 1, n_groups)
+        # Permute: (T, H_kv, ...) -> (H_kv, T, ...)
+        # This is equivalent to reshape when T=1 but correct for any T.
+        # mse_packed: (T, H_kv, packed_d) -> (H_kv, T, packed_d)
+        # norms/res_norms: (T, H_kv) -> (H_kv, T)
+        # v_data: (T, H_kv, D) -> (H_kv, T, D)
+        # GQA expansion will happen inside turboquant_fused_decode
+        mse_packed = mse_packed.permute(1, 0, 2).contiguous()  # (H_kv, T, packed_d)
+        qjl_signs = qjl_signs.permute(1, 0, 2).contiguous()    # (H_kv, T, D//8)
+        norms = norms.permute(1, 0).contiguous()               # (H_kv, T)
+        res_norms = res_norms.permute(1, 0).contiguous()       # (H_kv, T)
+        v_data = v_data.permute(1, 0, 2).contiguous()          # (H_kv, T, D)
+        v_scales = v_scales.permute(1, 0, 2).contiguous()     # (H_kv, T, n_groups)
+        v_zeros = v_zeros.permute(1, 0, 2).contiguous()      # (H_kv, T, n_groups)
 
         # Flatten query from (T, Q, D) to (BH, D) for kernel
         query_flat = query.reshape(-1, D)  # (BH, D)
