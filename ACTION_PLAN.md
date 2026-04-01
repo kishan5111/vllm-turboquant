@@ -1,87 +1,93 @@
-# AIMO-3 Throughput Optimization - Action Plan
+# TurboQuant Fused Backend — Action Plan
 
 ## Executive Summary
 
-**Current State** (2026-03-31):
-- TQ4bit at 65k context: **27.8 tok/s** (up from 20.4, **+36% improvement**)
-- TQ4bit now at **74% of FP8** aggregate throughput (was 55%)
-- Need: 12-18x concurrency with equivalent throughput
+**Current State** (2026-04-01):
+- TurboQuant Fused (3-bit key, 2-bit value) integrated with vLLM v1
+- **1205 tok/s** with cudagraph + PyTorch fallback attention
+- **1258 tok/s** FP8 KV baseline with cudagraph + FlashInfer
+- Gap: **~4%** behind FP8
+- Fused kernel (Triton) is GQA-aware and wired but rarely exercised during cudagraph
 
-**Root Causes Identified and Fixed**:
-1. ✅ Inverted num_stages heuristic - disabled pipelining at high concurrency
-2. ✅ num_warps too low - 4 warps insufficient for GQA_RATIO=8
-3. ✅ kv_splits target too aggressive - 4224 programs at 64 requests caused resource contention
-4. ✅ **NEW: USE_BT_PREFETCH threshold** - was 64, caused dependent loads at 65k context
-
-**Remaining Gap**: 26% behind FP8 due to fundamental decompression arithmetic overhead.
+**Root Causes Fixed**:
+1. ✅ Wrong `num_query_heads` — was reading from wrapper instead of impl
+2. ✅ Missing transpose in "recent only" decode branch
+3. ✅ `torch.tensor()` allocation in `_pack_qjl_signs` breaking cudagraph
 
 ## Changes Applied
 
-### 1. Inverted num_stages Heuristic (FIXED)
-**Before**:
-```python
-num_stages = 1 if blocks_per_split >= 128 else 2 if blocks_per_split >= 64 else 3
-```
+### 1. `num_query_heads` Fix
+Reading from `attn_module.num_heads` returned 8 (wrapper), but impl has 64.
+GPT-OSS: 64 Q-heads, 8 KV-heads, GQA ratio=8.
 
-**After**:
-```python
-num_stages = 4 if blocks_per_split >= 256 else 3 if blocks_per_split >= 128 else 2
-```
+### 2. Transpose Fix in "Recent Only" Branch
+Ring buffer returns `(T, H_kv, D)` but `_matmul_attention` expects `(H_kv, T, D)`.
+Only the "history+recent" path had the transpose via `_get_all_keys_values`.
 
-### 2. Increased num_warps (FIXED)
-**Before**: 4 warps
-**After**: 8 warps
+### 3. CUDA Graph Compatibility Fix
+`torch.tensor([1,2,4,8,16,32,64,128], device=x.device)` in hot path
+breaks cudagraph capture. Pre-allocated as `register_buffer` instead.
 
-### 3. Reduced kv_splits Target (FIXED)
-**Before**: `target = _SM_COUNT * 32` → 4224 programs
-**After**: `target = _SM_COUNT * 16` → 2112 programs
+## Benchmark Results
 
-### 4. USE_BT_PREFETCH Threshold (FIXED)
-**Before**: `use_bt_prefetch = (bps_pow2 <= 64)` ← **disabled at 65k context!**
-**After**: `use_bt_prefetch = (bps_pow2 <= 256)`
+**GPT-OSS 20B, 8 prompts, 128 max_tokens**:
 
-At 65k context with 2 sequences, `blocks_per_split=128` exceeded the old threshold,
-causing dependent loads that prevented memory pipelining.
+| Config | Mode | Throughput | Gap to FP8 cudagraph |
+|--------|------|----------:|----------------------|
+| BF16 KV | eager | ~207 tok/s | +baseline |
+| FP8 KV | eager | ~186 tok/s | -10% |
+| FP8 KV | cudagraph | **~1263 tok/s** | — |
+| TQ 3K/2V | eager | ~189 tok/s | similar to FP8 eager |
+| TQ 3K/2V | cudagraph | **~1206 tok/s** | **-4%** |
 
-## Test Results
+**Key insight**: Gap with cudagraph is only 4%, not the 10-20% we feared.
+The PyTorch fallback attention is comparable to FlashAttention on this workload.
 
-**TQ4bit at 65k context**:
-| Metric | Before | After | Improvement |
-|--------|--------|-------|-------------|
-| Aggregate tok/s | 20.4 | 27.8 | **+36%** |
-| TTFT | 5.4s | 3.4s | **-37%** |
+## Next Steps (Priority Order)
 
-**TQ4bit vs FP8** (65k context, 2 requests):
-| Metric | TQ4bit | FP8 | Ratio |
-|--------|--------|-----|-------|
-| Aggregate tok/s | 27.8 | 37.4 | 0.74 |
-| Decode tok/s | 56.5 | 59.4 | 0.95 |
-| TTFT | 3.4s | 2.3s | 1.48 |
+### P0 — Extend fused kernel for "history+recent" path (closes the 4% gap)
 
-## Next Steps
+**What was done**: GQA support added to Triton kernel (`gqa_ratio` param + `repeat_interleave` expansion).
+Kernel wired in `_compute_fused_attention` for "history only" case.
 
-### Short-term (kernel tuning):
-1. Profile remaining bottleneck - likely decompression arithmetic
-2. Consider INT8 WMMA path to halve dequant arithmetic
+**Why not fully working**: During cudagraph warmup, ring buffer always gets tokens after first
+decode step, so the "history+recent" path is always taken in benchmark. The fused kernel
+only runs in the rare "history only" case.
 
-### Medium-term:
-1. FlashInfer integration for TQ4bit - only path to truly closing the gap
-2. Test on 120B model - different capacity/speed tradeoff
+**Fix needed**:
+1. Extend fused kernel to handle combined history+recent tokens (concatenate compressed
+   history with ring buffer float data, or add a second kernel stage)
+2. Or: Optimize `_matmul_attention` PyTorch fallback to be FlashInfer-competitive
+3. Benchmark to verify we reach ~1258 tok/s
 
-### Long-term:
-1. Multi-GPU with Expert Parallelism for MoE models
-2. Disaggregated Prefill/Decode (FP8 for prefill, TQ4bit for decode)
+### P1 — 0 Flash Layers Detection
+
+`install_hooks` reports "0 flash layers" because `LayerConfig.backend_kind`
+is never set. This means the flash attention path is not being used as a fallback.
+Currently all attention goes through TQ patched path.
+
+**Fix**: Set `backend_kind` in `LayerConfig` or detect it another way.
+
+### P2 — FlashInfer Integration (long-term)
+
+FlashInfer is vLLM's optimized decode attention backend for FP8.
+TQ would benefit from FlashInfer-style kernels that compute directly from
+packed quantized data — similar to how FlashInfer computes from FP8.
 
 ## Success Criteria
 
-**Minimum viable**: 12x concurrency @ equivalent aggregate throughput to current 6x FP8
+**Minimum**: TQ cudagraph throughput ≥ FP8 cudagraph throughput (1263 tok/s)
+- Wire Triton kernels to close the 4% gap
+- Verify output quality remains identical
 
-**Target**: 18x concurrency @ 80% of current per-request speed
-- This gives 2.4x more total output tokens per second
-- Sufficient to win AIMO-3 competition
+**Stretch**: TQ cudagraph throughput > FP8 cudagraph throughput
+- Fused compute from packed data avoids dequantization memory bandwidth
+- Should be measurable once kernels are GQA-aware
 
-## Key Insight
+## Key Files to Modify
 
-The "99.8% overhead" was misleading - it compared actual time to pure memory transfer time, ignoring attention compute cost. The real issue was **zero pipelining** causing memory stalls while compute sat idle.
-
-After fixes, TQ4bit is now at 74% of FP8 aggregate throughput. The remaining 26% gap is fundamental decompression arithmetic overhead that requires either FlashInfer integration or INT8 WMMA to close.
+| File | Change |
+|------|--------|
+| `vllm/v1/attention/ops/triton_turboquant_fused_decode.py` | Add GQA support to fused kernel |
+| `vllm/v1/attention/backends/turboquant_fused_backend.py` | Wire Triton kernel as compute path |
+| `vllm/v1/attention/backends/turboquant_fused_backend.py` | Set `backend_kind` for flash layer detection |
